@@ -100,6 +100,7 @@ target_compile_features(ts-live PRIVATE cxx_std_20)
 target_include_directories(ts-live PRIVATE ${CMAKE_BINARY_DIR}/install/include ${CMAKE_BINARY_DIR}/ffmpeg-prefix/src/ffmpeg)
 target_link_libraries(ts-live fmt::fmt spdlog::spdlog ${FFMPEG_LIBRARIES} embind tsreadex::lib)
 target_link_options(ts-live PRIVATE
+  "-gsource-map"
   "-Wno-pthreads-mem-growth"
   "SHELL:-s ALLOW_MEMORY_GROWTH=1"
   "SHELL:-s WASM=1"
@@ -129,4 +130,4 @@ else()
 endif()
 
 install(TARGETS ts-live DESTINATION .)
-install(FILES ${CMAKE_BINARY_DIR}/ts-live.wasm ${CMAKE_BINARY_DIR}/ts-live.worker.js DESTINATION .)
+install(FILES ${CMAKE_BINARY_DIR}/ts-live.wasm ${CMAKE_BINARY_DIR}/ts-live.wasm.map ${CMAKE_BINARY_DIR}/ts-live.worker.js DESTINATION .)
