@@ -130,4 +130,4 @@ else()
 endif()
 
 install(TARGETS ts-live DESTINATION .)
-install(FILES ${CMAKE_BINARY_DIR}/ts-live.wasm ${CMAKE_BINARY_DIR}/ts-live.wasm.map ${CMAKE_BINARY_DIR}/ts-live.worker.js DESTINATION .)
+install(FILES ${CMAKE_BINARY_DIR}/ts-live.wasm ${CMAKE_BINARY_DIR}/ts-live.wasm.map DESTINATION .)
