@@ -42,7 +42,8 @@ const size_t MAX_VIDEO_FRAME_QUEUE_SIZE = 8;
 // (小さいとちょっとしたことでリップシンク条件によりキューの生産も消費も止まる)
 const size_t MAX_VIDEO_PACKET_QUEUE_SIZE = 60;
 
-std::chrono::system_clock::time_point startTime;
+int64_t currentPlaybackTime = 0;
+int64_t currentPlaybackPtsTime = 0;
 
 bool resetedDecoder = false;
 std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
@@ -661,10 +662,8 @@ void decoderMainloop() {
                 videoPacketQueue.size(), audioPacketQueue.size());
 
   if (videoStream && !audioStreamList.empty() && !statsCallback.isNull()) {
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now() - startTime);
     auto data = emscripten::val::object();
-    data.set("time", duration.count() / 1000.0);
+    data.set("time", currentPlaybackTime / 1000.0);
     data.set("VideoFrameQueueSize", videoFrameQueue.size());
     data.set("AudioFrameQueueSize", audioFrameQueue.size());
     data.set("AudioWorkletBufferSize", bufferedAudioSamples);
@@ -752,6 +751,16 @@ void decoderMainloop() {
 
     // リップシンク条件を満たしてたらVideoFrame再生
     if (showFlag) {
+      int64_t ptsTime = (int64_t)(videoPtsTime * 1000);
+      if (currentPlaybackPtsTime < ptsTime - 1000 ||
+          currentPlaybackPtsTime > ptsTime + 1000) {
+        // 不連続なのでリセット
+        currentPlaybackPtsTime = ptsTime;
+      } else if (currentPlaybackPtsTime < ptsTime) {
+        // 再生時刻を増やす
+        currentPlaybackTime += ptsTime - currentPlaybackPtsTime;
+        currentPlaybackPtsTime = ptsTime;
+      }
       {
         std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameQueue.pop_front();

@@ -1,8 +1,6 @@
 #pragma once
 #include <emscripten/val.h>
 
-extern std::chrono::system_clock::time_point startTime;
-
 void initDecoder();
 void decoderMainloop();
 
