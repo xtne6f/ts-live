@@ -51,7 +51,7 @@ AVCodecContext *audioCodecContext = nullptr;
 
 std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 std::deque<std::pair<int64_t, std::vector<uint8_t>>> captionDataQueue;
-std::mutex videoFrameMtx, audioFrameMtx, captionDataMtx;
+std::mutex captionDataMtx;
 bool videoFrameFound = false;
 
 std::deque<AVPacket *> videoPacketQueue, audioPacketQueue;
@@ -207,6 +207,11 @@ void resetInternal() {
       videoPacketQueue.pop_front();
       av_packet_free(&ppacket);
     }
+    while (!videoFrameQueue.empty()) {
+      auto frame = videoFrameQueue.front();
+      videoFrameQueue.pop_front();
+      av_frame_free(&frame);
+    }
   }
   {
     std::lock_guard<std::mutex> lock(audioPacketMtx);
@@ -215,17 +220,6 @@ void resetInternal() {
       audioPacketQueue.pop_front();
       av_packet_free(&ppacket);
     }
-  }
-  {
-    std::lock_guard<std::mutex> lock(videoFrameMtx);
-    while (!videoFrameQueue.empty()) {
-      auto frame = videoFrameQueue.front();
-      videoFrameQueue.pop_front();
-      av_frame_free(&frame);
-    }
-  }
-  {
-    std::lock_guard<std::mutex> lock(audioFrameMtx);
     while (!audioFrameQueue.empty()) {
       auto frame = audioFrameQueue.front();
       audioFrameQueue.pop_front();
@@ -332,7 +326,7 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
 
       AVFrame *cloneFrame = av_frame_clone(frame);
       {
-        std::lock_guard<std::mutex> lock(videoFrameMtx);
+        std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameFound = true;
 
         videoFrameQueue.push_back(cloneFrame);
@@ -415,7 +409,7 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
       frame->time_base = audioStreamList[0]->time_base;
       if (videoFrameFound) {
         AVFrame *cloneFrame = av_frame_clone(frame);
-        std::lock_guard<std::mutex> lock(audioFrameMtx);
+        std::lock_guard<std::mutex> lock(audioPacketMtx);
         audioFrameQueue.push_back(cloneFrame);
       }
     }
@@ -682,7 +676,7 @@ void decoderMainloop() {
   // time_base が 0/0 な不正フレームが入ってたら捨てる
   AVFrame *currentFrame = nullptr;
   {
-    std::lock_guard<std::mutex> lock(videoFrameMtx);
+    std::lock_guard<std::mutex> lock(videoPacketMtx);
     while (!videoFrameQueue.empty()) {
       AVFrame *frame = videoFrameQueue.front();
       if (frame->time_base.den == 0 || frame->time_base.num == 0) {
@@ -696,7 +690,7 @@ void decoderMainloop() {
   }
   AVFrame *audioFrame = nullptr;
   {
-    std::lock_guard<std::mutex> lock(audioFrameMtx);
+    std::lock_guard<std::mutex> lock(audioPacketMtx);
     while (!audioFrameQueue.empty()) {
       AVFrame *frame = audioFrameQueue.front();
       if (frame->time_base.den == 0 || frame->time_base.num == 0) {
@@ -710,7 +704,7 @@ void decoderMainloop() {
   }
 
   if (currentFrame && audioFrame) {
-    // std::lock_guard<std::mutex> lock(videoFrameMtx);
+    // std::lock_guard<std::mutex> lock(videoPacketMtx);
     // spdlog::info("found Current Frame {}x{} bufferSize:{}",
     // currentFrame->width,
     //              currentFrame->height, bufferSize);
@@ -747,7 +741,7 @@ void decoderMainloop() {
     // リップシンク条件を満たしてたらVideoFrame再生
     if (showFlag) {
       {
-        std::lock_guard<std::mutex> lock(videoFrameMtx);
+        std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameQueue.pop_front();
       }
       double timestamp =
@@ -795,7 +789,7 @@ void decoderMainloop() {
   while (audioFrameQueue.size() > 1) {
     AVFrame *frame = nullptr;
     {
-      std::lock_guard<std::mutex> lock(audioFrameMtx);
+      std::lock_guard<std::mutex> lock(audioPacketMtx);
       frame = audioFrameQueue.front();
       audioFrameQueue.pop_front();
     }
