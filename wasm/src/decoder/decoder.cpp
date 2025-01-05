@@ -35,6 +35,13 @@ const size_t PROBE_SIZE = 1024 * 1024;
 const size_t DEFAULT_WIDTH = 1920;
 const size_t DEFAULT_HEIGHT = 1080;
 
+// 高コストなのでスレッド間の処理の揺らぎを補償する最低限にする
+const size_t MAX_VIDEO_FRAME_QUEUE_SIZE = 8;
+
+// 映像と音声のパケットには時差があるので最低でも20程度必要
+// (小さいとちょっとしたことでリップシンク条件によりキューの生産も消費も止まる)
+const size_t MAX_VIDEO_PACKET_QUEUE_SIZE = 60;
+
 std::chrono::system_clock::time_point startTime;
 
 bool resetedDecoder = false;
@@ -276,8 +283,11 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
     AVPacket *ppacket;
     {
       std::unique_lock<std::mutex> lock(videoPacketMtx);
-      videoPacketCv.wait(
-          lock, [&] { return !videoPacketQueue.empty() || terminateFlag; });
+      videoPacketCv.wait(lock, [&] {
+        return (videoFrameQueue.size() < MAX_VIDEO_FRAME_QUEUE_SIZE &&
+                !videoPacketQueue.empty()) ||
+               terminateFlag;
+      });
       if (terminateFlag) {
         break;
       }
@@ -535,7 +545,7 @@ void decoderThreadFunc() {
 
   // decode phase
   while (!resetedDecoder) {
-    if (videoFrameQueue.size() > 30 || videoPacketQueue.size() > 10) {
+    if (videoPacketQueue.size() >= MAX_VIDEO_PACKET_QUEUE_SIZE) {
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
       continue;
     }
@@ -682,6 +692,8 @@ void decoderMainloop() {
       if (frame->time_base.den == 0 || frame->time_base.num == 0) {
         videoFrameQueue.pop_front();
         av_frame_free(&frame);
+        // キューが減ることでスレッドがデコードを再開するかもしれないため
+        videoPacketCv.notify_all();
       } else {
         currentFrame = frame;
         break;
@@ -743,6 +755,8 @@ void decoderMainloop() {
       {
         std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameQueue.pop_front();
+        // キューが減ることでスレッドがデコードを再開するかもしれないため
+        videoPacketCv.notify_all();
       }
       double timestamp =
           currentFrame->pts * av_q2d(currentFrame->time_base) * 1000000;
