@@ -29,64 +29,25 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
     }
     this.started = true
 
-    const buffer0 = this.buffers0[0]
-    const buffer1 = this.buffers1[0]
-
-    if (buffer0.length - this.currentBufferReadSize > output[0].length) {
-      output[0].set(
-        buffer0.subarray(
-          this.currentBufferReadSize,
-          this.currentBufferReadSize + output[0].length
-        )
-      )
-      output[1].set(
-        buffer1.subarray(
-          this.currentBufferReadSize,
-          this.currentBufferReadSize + output[0].length
-        )
-      )
-      this.currentBufferReadSize += output[0].length
-      this.bufferedSamples -= output[0].length
-    } else {
-      const copySize = buffer0.length - this.currentBufferReadSize
-      output[0].set(
-        buffer0.subarray(
-          this.currentBufferReadSize,
-          this.currentBufferReadSize + copySize
-        )
-      )
-      output[1].set(
-        buffer1.subarray(
-          this.currentBufferReadSize,
-          this.currentBufferReadSize + copySize
-        )
-      )
-      this.bufferedSamples -= copySize
-      this.currentBufferReadSize = 0
-      if (output[0].length > copySize) {
-        if (this.buffers0.length > 1) {
-          output[0].set(
-            buffers0[1].subarray(0, output[0].length - copySize),
-            copySize
-          )
-          output[1].set(
-            buffers1[1].subarray(0, output[0].length - copySize),
-            copySize
-          )
-          this.bufferedSamples -= output[0].length - copySize
-          this.currentBufferReadSize = copySize
-          this.buffers0.shift()
-          this.buffers1.shift()
-        } else {
-          output[0].fill(0, copySize)
-          output[1].fill(0, copySize)
-          this.buffers0.shift()
-          this.buffers1.shift()
-        }
-      } else {
+    for (let offset = 0;
+         offset < output[0].length && this.bufferedSamples > 0;) {
+      const buffer0 = this.buffers0[0]
+      const buffer1 = this.buffers1[0]
+      const bufferOffset = this.currentBufferReadSize
+      let copySize = output[0].length - offset
+      this.currentBufferReadSize += copySize
+      if (this.currentBufferReadSize >= buffer0.length) {
+        copySize = buffer0.length - bufferOffset
+        this.currentBufferReadSize = 0
         this.buffers0.shift()
         this.buffers1.shift()
       }
+      output[0].set(buffer0.subarray(bufferOffset, bufferOffset + copySize),
+                    offset)
+      output[1].set(buffer1.subarray(bufferOffset, bufferOffset + copySize),
+                    offset)
+      offset += copySize
+      this.bufferedSamples -= copySize
     }
     if (this.processCallCount++ % 20 == 0) {
       this.port.postMessage(this.bufferedSamples)
