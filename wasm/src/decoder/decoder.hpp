@@ -11,3 +11,4 @@ void setStatsCallback(emscripten::val callback);
 void reset();
 void playFile(std::string url);
 void setDualMonoMode(int mode);
+void setPlaybackRate(double rate);
