@@ -46,7 +46,6 @@ void mainloop(void *arg) {
 
 int main() {
   spdlog::info("Wasm main() started.");
-  startTime = std::chrono::system_clock::now();
 
   // デコーダスレッド起動
   spdlog::info("initializing Decoder");
@@ -84,4 +83,5 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setBufferedAudioSamples", &setBufferedAudioSamples);
   emscripten::function("setAudioGain", &setAudioGain);
   emscripten::function("setDualMonoMode", &setDualMonoMode);
+  emscripten::function("setPlaybackRate", &setPlaybackRate);
 }

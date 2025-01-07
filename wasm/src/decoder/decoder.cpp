@@ -14,6 +14,9 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
@@ -21,7 +24,6 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
-#include <libswresample/swresample.h>
 }
 
 // tsreadex
@@ -35,7 +37,15 @@ const size_t PROBE_SIZE = 1024 * 1024;
 const size_t DEFAULT_WIDTH = 1920;
 const size_t DEFAULT_HEIGHT = 1080;
 
-std::chrono::system_clock::time_point startTime;
+// 高コストなのでスレッド間の処理の揺らぎを補償する最低限にする
+const size_t MAX_VIDEO_FRAME_QUEUE_SIZE = 8;
+
+// 映像と音声のパケットには時差があるので最低でも20程度必要
+// (小さいとちょっとしたことでリップシンク条件によりキューの生産も消費も止まる)
+const size_t MAX_VIDEO_PACKET_QUEUE_SIZE = 60;
+
+int64_t currentPlaybackTime = 0;
+int64_t currentPlaybackPtsTime = 0;
 
 bool resetedDecoder = false;
 std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
@@ -51,7 +61,7 @@ AVCodecContext *audioCodecContext = nullptr;
 
 std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 std::deque<std::pair<int64_t, std::vector<uint8_t>>> captionDataQueue;
-std::mutex videoFrameMtx, audioFrameMtx, captionDataMtx;
+std::mutex captionDataMtx;
 bool videoFrameFound = false;
 
 std::deque<AVPacket *> videoPacketQueue, audioPacketQueue;
@@ -96,6 +106,20 @@ void setDualMonoMode(int mode) {
   dualMonoMode = (DualMonoMode)mode;
 }
 
+double targetAudioTempo = 1.0;
+double currentAudioTempo = 1.0;
+
+void setPlaybackRate(double rate) {
+  //
+  if (!(rate >= 0.5 && rate <= 100.0)) {
+    // atempoフィルタの範囲外
+    spdlog::error("setPlaybackRate() out of range [0.5 - 100]");
+    return;
+  }
+  std::lock_guard<std::mutex> lock(audioPacketMtx);
+  targetAudioTempo = rate;
+}
+
 // Buffer control
 emscripten::val getNextInputBuffer(size_t nextSize) {
   std::lock_guard<std::mutex> lock(inputBufferMtx);
@@ -107,7 +131,6 @@ emscripten::val getNextInputBuffer(size_t nextSize) {
     inputBufferWriteIndex = remainSize;
   }
   if (inputBufferWriteIndex + nextSize >= MAX_INPUT_BUFFER) {
-    spdlog::error("Buffer overflow");
     return emscripten::val::null();
   }
   auto retVal = emscripten::val(emscripten::typed_memory_view<uint8_t>(
@@ -207,6 +230,11 @@ void resetInternal() {
       videoPacketQueue.pop_front();
       av_packet_free(&ppacket);
     }
+    while (!videoFrameQueue.empty()) {
+      auto frame = videoFrameQueue.front();
+      videoFrameQueue.pop_front();
+      av_frame_free(&frame);
+    }
   }
   {
     std::lock_guard<std::mutex> lock(audioPacketMtx);
@@ -215,17 +243,6 @@ void resetInternal() {
       audioPacketQueue.pop_front();
       av_packet_free(&ppacket);
     }
-  }
-  {
-    std::lock_guard<std::mutex> lock(videoFrameMtx);
-    while (!videoFrameQueue.empty()) {
-      auto frame = videoFrameQueue.front();
-      videoFrameQueue.pop_front();
-      av_frame_free(&frame);
-    }
-  }
-  {
-    std::lock_guard<std::mutex> lock(audioFrameMtx);
     while (!audioFrameQueue.empty()) {
       auto frame = audioFrameQueue.front();
       audioFrameQueue.pop_front();
@@ -282,8 +299,11 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
     AVPacket *ppacket;
     {
       std::unique_lock<std::mutex> lock(videoPacketMtx);
-      videoPacketCv.wait(
-          lock, [&] { return !videoPacketQueue.empty() || terminateFlag; });
+      videoPacketCv.wait(lock, [&] {
+        return (videoFrameQueue.size() < MAX_VIDEO_FRAME_QUEUE_SIZE &&
+                !videoPacketQueue.empty()) ||
+               terminateFlag;
+      });
       if (terminateFlag) {
         break;
       }
@@ -332,7 +352,7 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
 
       AVFrame *cloneFrame = av_frame_clone(frame);
       {
-        std::lock_guard<std::mutex> lock(videoFrameMtx);
+        std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameFound = true;
 
         videoFrameQueue.push_back(cloneFrame);
@@ -345,6 +365,57 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
   avcodec_close(videoCodecContext);
   spdlog::debug("freeing videoCodecContext");
   avcodec_free_context(&videoCodecContext);
+}
+
+AVFilterGraph *allocAudioFilterGraph(double tempo, int sampleRate,
+                                     AVSampleFormat format,
+                                     uint64_t channelLayout,
+                                     AVFilterContext *&abufferContext,
+                                     AVFilterContext *&abuffersinkContext) {
+  const AVFilter *abuffer = avfilter_get_by_name("abuffer");
+  const AVFilter *abuffersink = avfilter_get_by_name("abuffersink");
+  const AVFilter *aformat = avfilter_get_by_name("aformat");
+  const AVFilter *atempo = avfilter_get_by_name("atempo");
+  if (!abuffer || !abuffersink || !aformat || !atempo) {
+    return nullptr;
+  }
+  AVFilterGraph *graph = avfilter_graph_alloc();
+  if (!graph) {
+    return nullptr;
+  }
+
+  AVFilterContext *aformatContext;
+  std::string args =
+      fmt::format("sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
+                  sampleRate, av_get_sample_fmt_name(format), channelLayout);
+  if (avfilter_graph_create_filter(&abufferContext, abuffer, "af_in",
+                                   args.c_str(), nullptr, graph) >= 0 &&
+      avfilter_graph_create_filter(&abuffersinkContext, abuffersink, "af_out",
+                                   nullptr, nullptr, graph) >= 0 &&
+      avfilter_graph_create_filter(
+          &aformatContext, aformat, "af_format",
+          "sample_rates=48000:sample_fmts=fltp:channel_layouts=stereo", nullptr,
+          graph) >= 0) {
+    if (tempo != 1.0) {
+      // atempoフィルタを挟む
+      AVFilterContext *atempoContext;
+      if (avfilter_graph_create_filter(&atempoContext, atempo, "af_tempo",
+                                       fmt::format("{}", tempo).c_str(),
+                                       nullptr, graph) >= 0 &&
+          avfilter_link(abufferContext, 0, atempoContext, 0) >= 0 &&
+          avfilter_link(atempoContext, 0, aformatContext, 0) >= 0 &&
+          avfilter_link(aformatContext, 0, abuffersinkContext, 0) >= 0 &&
+          avfilter_graph_config(graph, nullptr) >= 0) {
+        return graph;
+      }
+    } else if (avfilter_link(abufferContext, 0, aformatContext, 0) >= 0 &&
+               avfilter_link(aformatContext, 0, abuffersinkContext, 0) >= 0 &&
+               avfilter_graph_config(graph, nullptr) >= 0) {
+      return graph;
+    }
+  }
+  avfilter_graph_free(&graph);
+  return nullptr;
 }
 
 void audioDecoderThreadFunc(bool &terminateFlag) {
@@ -381,6 +452,15 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
 
   AVFrame *frame = av_frame_alloc();
 
+  bool reallocGraph = true;
+  int currentSampleRate = 0;
+  int currentFormat = -1;
+  uint64_t currentChannelLayout = 0;
+  AVFilterGraph *filterGraph = nullptr;
+  AVFilterContext *abufferContext = nullptr;
+  AVFilterContext *abuffersinkContext = nullptr;
+  AVFrame *filtFrame = av_frame_alloc();
+
   while (!terminateFlag) {
     AVPacket *ppacket;
     {
@@ -392,6 +472,10 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
       }
       ppacket = audioPacketQueue.front();
       audioPacketQueue.pop_front();
+      if (currentAudioTempo != targetAudioTempo) {
+        currentAudioTempo = targetAudioTempo;
+        reallocGraph = true;
+      }
     }
     AVPacket &packet = *ppacket;
 
@@ -406,21 +490,90 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
                     "timebase:{} buf[0].size:{} buf[1].size:{} nb_samples:{} "
                     "ch:{} ch_layout:{:016x}",
                     frame->format, frame->pts, av_q2d(frame->time_base),
-                    av_q2d(audioStreamList[0]->time_base), frame->buf[0]->size,
-                    frame->buf[1]->size, frame->nb_samples, frame->channels,
-                    frame->channel_layout);
+                    av_q2d(audioStreamList[0]->time_base),
+                    frame->buf[0] ? frame->buf[0]->size : 0,
+                    frame->buf[1] ? frame->buf[1]->size : 0, frame->nb_samples,
+                    frame->channels, frame->channel_layout);
       if (initPts < 0) {
         initPts = frame->pts;
       }
       frame->time_base = audioStreamList[0]->time_base;
       if (videoFrameFound) {
-        AVFrame *cloneFrame = av_frame_clone(frame);
-        std::lock_guard<std::mutex> lock(audioFrameMtx);
-        audioFrameQueue.push_back(cloneFrame);
+        if (currentSampleRate != frame->sample_rate ||
+            currentFormat != frame->format ||
+            currentChannelLayout != frame->channel_layout) {
+          spdlog::info(
+              "AudioFrame {}: sample_rate:{}->{} layout:0x{:x}->0x{:x}",
+              currentFormat < 0 ? "Received initially" : "Changed",
+              currentSampleRate, frame->sample_rate, currentChannelLayout,
+              frame->channel_layout);
+          currentSampleRate = frame->sample_rate;
+          currentFormat = frame->format;
+          currentChannelLayout = frame->channel_layout;
+          reallocGraph = true;
+        }
+        if (reallocGraph) {
+          reallocGraph = false;
+          avfilter_graph_free(&filterGraph);
+          if (currentAudioTempo != 1.0) {
+            filterGraph = allocAudioFilterGraph(
+                currentAudioTempo, currentSampleRate,
+                (AVSampleFormat)currentFormat, currentChannelLayout,
+                abufferContext, abuffersinkContext);
+            if (!filterGraph) {
+              spdlog::error("allocAudioFilterGraph({}) failed",
+                            currentAudioTempo);
+            }
+          }
+          if (!filterGraph && (currentSampleRate != 48000 ||
+                               currentFormat != AV_SAMPLE_FMT_FLTP ||
+                               currentChannelLayout != AV_CH_LAYOUT_STEREO)) {
+            filterGraph = allocAudioFilterGraph(
+                1.0, currentSampleRate, (AVSampleFormat)currentFormat,
+                currentChannelLayout, abufferContext, abuffersinkContext);
+            if (!filterGraph) {
+              spdlog::error("allocAudioFilterGraph(1.0) failed");
+            }
+          }
+        }
+
+        if (filterGraph) {
+          // PTSはそのままで音声サンプル数だけを増減させる
+          auto pts = frame->pts;
+          ret = av_buffersrc_add_frame(abufferContext, frame);
+          if (ret >= 0) {
+            while (av_buffersink_get_frame(abuffersinkContext, filtFrame) >=
+                   0) {
+              // 常にFLTP,48000Hz,stereoのはず
+              spdlog::debug("AudioFrame(Filtered): format:{} pts:{} frame "
+                            "timebase:{} buf[0].size:{} buf[1].size:{} "
+                            "nb_samples:{} ch:{} ch_layout:{:016x}",
+                            filtFrame->format, filtFrame->pts,
+                            av_q2d(filtFrame->time_base),
+                            filtFrame->buf[0]->size, filtFrame->buf[1]->size,
+                            filtFrame->nb_samples, filtFrame->channels,
+                            filtFrame->channel_layout);
+              filtFrame->pts = pts;
+              filtFrame->time_base = audioStreamList[0]->time_base;
+              std::lock_guard<std::mutex> lock(audioPacketMtx);
+              audioFrameQueue.push_back(filtFrame);
+              filtFrame = av_frame_alloc();
+            }
+          } else {
+            spdlog::error("av_buffersrc_add_frame(audio) failed: {} {}", ret,
+                          av_err2str(ret));
+          }
+        } else {
+          AVFrame *cloneFrame = av_frame_clone(frame);
+          std::lock_guard<std::mutex> lock(audioPacketMtx);
+          audioFrameQueue.push_back(cloneFrame);
+        }
       }
     }
     av_packet_free(&ppacket);
   }
+  av_frame_free(&filtFrame);
+  avfilter_graph_free(&filterGraph);
   spdlog::debug("closing audioCodecContext");
   avcodec_close(audioCodecContext);
   spdlog::debug("freeing videoCodecContext");
@@ -541,7 +694,7 @@ void decoderThreadFunc() {
 
   // decode phase
   while (!resetedDecoder) {
-    if (videoFrameQueue.size() > 30 || videoPacketQueue.size() > 10) {
+    if (videoPacketQueue.size() >= MAX_VIDEO_PACKET_QUEUE_SIZE) {
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
       continue;
     }
@@ -644,12 +797,6 @@ void initDecoder() {
   servicefilter.SetSuperimposeMode(2);
 }
 
-SwrContext *swr = nullptr;
-uint8_t *swrOutput[2] = {nullptr, nullptr};
-int swrOutputSize = 0;
-int64_t channel_layout = 0;
-int sample_rate = 0;
-
 void decoderMainloop() {
   spdlog::debug("decoderMainloop videoFrameQueue:{} audioFrameQueue:{} "
                 "videoPacketQueue:{} audioPacketQueue:{}",
@@ -657,10 +804,8 @@ void decoderMainloop() {
                 videoPacketQueue.size(), audioPacketQueue.size());
 
   if (videoStream && !audioStreamList.empty() && !statsCallback.isNull()) {
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now() - startTime);
     auto data = emscripten::val::object();
-    data.set("time", duration.count() / 1000.0);
+    data.set("time", currentPlaybackTime / 1000.0);
     data.set("VideoFrameQueueSize", videoFrameQueue.size());
     data.set("AudioFrameQueueSize", audioFrameQueue.size());
     data.set("AudioWorkletBufferSize", bufferedAudioSamples);
@@ -682,12 +827,14 @@ void decoderMainloop() {
   // time_base が 0/0 な不正フレームが入ってたら捨てる
   AVFrame *currentFrame = nullptr;
   {
-    std::lock_guard<std::mutex> lock(videoFrameMtx);
+    std::lock_guard<std::mutex> lock(videoPacketMtx);
     while (!videoFrameQueue.empty()) {
       AVFrame *frame = videoFrameQueue.front();
       if (frame->time_base.den == 0 || frame->time_base.num == 0) {
         videoFrameQueue.pop_front();
         av_frame_free(&frame);
+        // キューが減ることでスレッドがデコードを再開するかもしれないため
+        videoPacketCv.notify_all();
       } else {
         currentFrame = frame;
         break;
@@ -695,8 +842,9 @@ void decoderMainloop() {
     }
   }
   AVFrame *audioFrame = nullptr;
+  double audioTempo;
   {
-    std::lock_guard<std::mutex> lock(audioFrameMtx);
+    std::lock_guard<std::mutex> lock(audioPacketMtx);
     while (!audioFrameQueue.empty()) {
       AVFrame *frame = audioFrameQueue.front();
       if (frame->time_base.den == 0 || frame->time_base.num == 0) {
@@ -707,10 +855,11 @@ void decoderMainloop() {
         break;
       }
     }
+    audioTempo = currentAudioTempo;
   }
 
   if (currentFrame && audioFrame) {
-    // std::lock_guard<std::mutex> lock(videoFrameMtx);
+    // std::lock_guard<std::mutex> lock(videoPacketMtx);
     // spdlog::info("found Current Frame {}x{} bufferSize:{}",
     // currentFrame->width,
     //              currentFrame->height, bufferSize);
@@ -738,17 +887,28 @@ void decoderMainloop() {
     // double estimatedAudioPlayTime =
     //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
     double estimatedAudioPlayTime =
-        audioPtsTime - (double)bufferedAudioSamples /
-                           audioStreamList[0]->codecpar->sample_rate;
+        audioPtsTime - (double)bufferedAudioSamples * audioTempo / 48000;
 
     // 1フレーム分くらいはズレてもいいからこれでいいか。フレーム真面目に考えると良くわからない。
     bool showFlag = estimatedAudioPlayTime > videoPtsTime;
 
     // リップシンク条件を満たしてたらVideoFrame再生
     if (showFlag) {
+      int64_t ptsTime = (int64_t)(videoPtsTime * 1000);
+      if (currentPlaybackPtsTime < ptsTime - 1000 ||
+          currentPlaybackPtsTime > ptsTime + 1000) {
+        // 不連続なのでリセット
+        currentPlaybackPtsTime = ptsTime;
+      } else if (currentPlaybackPtsTime < ptsTime) {
+        // 再生時刻を増やす
+        currentPlaybackTime += ptsTime - currentPlaybackPtsTime;
+        currentPlaybackPtsTime = ptsTime;
+      }
       {
-        std::lock_guard<std::mutex> lock(videoFrameMtx);
+        std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameQueue.pop_front();
+        // キューが減ることでスレッドがデコードを再開するかもしれないため
+        videoPacketCv.notify_all();
       }
       double timestamp =
           currentFrame->pts * av_q2d(currentFrame->time_base) * 1000000;
@@ -779,11 +939,8 @@ void decoderMainloop() {
       // 上記から推定される、現在再生している音声のPTS（時間）
       // double estimatedAudioPlayTime =
       //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
-      // 0除算を避けるためsample_rateがおかしいときはAudioのPTSをそのまま返す
-      int sampleRate = audioStreamList[0]->codecpar->sample_rate;
       double estimatedAudioPlayTime =
-          sampleRate ? audioPtsTime - (double)bufferedAudioSamples / sampleRate
-                     : audioPtsTime;
+          audioPtsTime - (double)bufferedAudioSamples * audioTempo / 48000;
 
       auto data = emscripten::val(
           emscripten::typed_memory_view<uint8_t>(buffer.size(), &buffer[0]));
@@ -795,7 +952,7 @@ void decoderMainloop() {
   while (audioFrameQueue.size() > 1) {
     AVFrame *frame = nullptr;
     {
-      std::lock_guard<std::mutex> lock(audioFrameMtx);
+      std::lock_guard<std::mutex> lock(audioPacketMtx);
       frame = audioFrameQueue.front();
       audioFrameQueue.pop_front();
     }
@@ -803,58 +960,8 @@ void decoderMainloop() {
                   frame->pts, av_q2d(frame->time_base), frame->nb_samples,
                   frame->channels);
 
-    if (frame->channels != 2) {
-      if (!swr || channel_layout != frame->channel_layout ||
-          sample_rate != frame->sample_rate) {
-        spdlog::info("SWR {}: sample_rate:{}->{} layout:{:x}->{:x}",
-                     swr ? "Changed" : "Initialized", sample_rate,
-                     frame->sample_rate, channel_layout, frame->channel_layout);
-        channel_layout = frame->channel_layout;
-        sample_rate = frame->sample_rate;
-        if (swr) {
-          swr_free(&swr);
-        }
-        swr = swr_alloc_set_opts(NULL, // we're allocating a new context
-                                 AV_CH_LAYOUT_STEREO,   // out_ch_layout
-                                 AV_SAMPLE_FMT_FLTP,    // out_sample_fmt
-                                 48000,                 // out_sample_rate
-                                 frame->channel_layout, // in_ch_layout
-                                 AV_SAMPLE_FMT_FLTP,    // in_sample_fmt
-                                 frame->sample_rate,    // in_sample_rate
-                                 0,                     // log_offset
-                                 NULL);                 // log_ctx
-        swr_init(swr);
-      }
-
-      int output_linesize;
-      int out_samples =
-          av_rescale_rnd(swr_get_delay(swr, 48000) + frame->nb_samples, 48000,
-                         48000, AV_ROUND_UP);
-      if (swrOutputSize != out_samples) {
-        if (swrOutput[0]) {
-          av_freep(&swrOutput[0]);
-        }
-        int linesize;
-        av_samples_alloc(swrOutput, &linesize, 2, out_samples,
-                         AV_SAMPLE_FMT_FLTP, sizeof(float));
-        spdlog::info("swr output[0]:{:p} output[1]:{:p} out_samples:{}->{} "
-                     "in_samples:{} linesize:{}",
-                     swrOutput[0], swrOutput[1], swrOutputSize, out_samples,
-                     frame->nb_samples, linesize);
-        swrOutputSize = out_samples;
-      }
-
-      out_samples =
-          swr_convert(swr, swrOutput, out_samples,
-                      (const uint8_t **)frame->data, frame->nb_samples);
-
-      feedAudioData(reinterpret_cast<float *>(swrOutput[0]),
-                    reinterpret_cast<float *>(swrOutput[1]), out_samples);
-    } else {
-      if (swr) {
-        spdlog::info("swr free (now 2ch audio).");
-        swr_free(&swr);
-      }
+    if (frame->sample_rate == 48000 && frame->format == AV_SAMPLE_FMT_FLTP &&
+        frame->channel_layout == AV_CH_LAYOUT_STEREO && frame->channels == 2) {
       feedAudioData(reinterpret_cast<float *>(frame->data[0]),
                     reinterpret_cast<float *>(frame->data[1]),
                     frame->nb_samples);
