@@ -131,7 +131,6 @@ emscripten::val getNextInputBuffer(size_t nextSize) {
     inputBufferWriteIndex = remainSize;
   }
   if (inputBufferWriteIndex + nextSize >= MAX_INPUT_BUFFER) {
-    spdlog::error("Buffer overflow");
     return emscripten::val::null();
   }
   auto retVal = emscripten::val(emscripten::typed_memory_view<uint8_t>(
