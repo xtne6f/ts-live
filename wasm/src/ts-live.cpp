@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "../../misc-wasm/src/grabber/grabber.hpp"
 #include "audio/audioworklet.hpp"
 #include "decoder/decoder.hpp"
 #include "video/webgpu.hpp"
@@ -88,4 +89,6 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("setAudioGain", &setAudioGain);
   emscripten::function("setDualMonoMode", &setDualMonoMode);
   emscripten::function("setPlaybackRate", &setPlaybackRate);
+  emscripten::function("getGrabberInputBuffer", &getGrabberInputBuffer);
+  emscripten::function("grabFirstFrame", &grabFirstFrame);
 }
