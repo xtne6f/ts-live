@@ -414,7 +414,7 @@ if (!ENVIRONMENT_IS_PTHREAD) {
   if (Module["wasmMemory"]) {
     wasmMemory = Module["wasmMemory"];
   } else {
-    var INITIAL_MEMORY = Module["INITIAL_MEMORY"] || 174063616;
+    var INITIAL_MEMORY = Module["INITIAL_MEMORY"] || 92274688;
     /** @suppress {checkTypes} */ wasmMemory = new WebAssembly.Memory({
       "initial": INITIAL_MEMORY / 65536,
       // In theory we should not need to emit the maximum if we want "unlimited"
@@ -733,8 +733,8 @@ var tempI64;
 // end include: runtime_debug.js
 // === Body ===
 var ASM_CONSTS = {
-  409188: () => Module && Module.myAudio && Module.myAudio.discardIntervalId ? 0 : 1,
-  409267: ($0, $1, $2) => {
+  409684: () => Module && Module.myAudio && Module.myAudio.discardIntervalId ? 0 : 1,
+  409763: ($0, $1, $2) => {
     if (Module && Module.myAudio && Module.myAudio.discardIntervalId) {
       const buffer0 = GROWABLE_HEAP_F32().slice($0 >> 2, ($0 >> 2) + $2);
       const buffer1 = GROWABLE_HEAP_F32().slice($1 >> 2, ($1 >> 2) + $2);
@@ -757,7 +757,7 @@ var ASM_CONSTS = {
       }, [ buffer0.buffer, buffer1.buffer ]);
     }
   },
-  409980: $0 => {
+  410476: $0 => {
     (async function() {
       const audioContext = new AudioContext({
         sampleRate: 48e3
@@ -801,7 +801,7 @@ var ASM_CONSTS = {
       }
     })();
   },
-  411249: $0 => {
+  411745: $0 => {
     if ($0 == 0 && !Module.myAudio) {
       let discardBaseTime = performance.now();
       Module.myAudio = {
@@ -7560,7 +7560,7 @@ var dynCall_iiiiijj = Module["dynCall_iiiiijj"] = (a0, a1, a2, a3, a4, a5, a6, a
 
 var dynCall_iiiiiijj = Module["dynCall_iiiiiijj"] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) => (dynCall_iiiiiijj = Module["dynCall_iiiiiijj"] = wasmExports["dynCall_iiiiiijj"])(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
 
-var ___emscripten_embedded_file_data = Module["___emscripten_embedded_file_data"] = 237040;
+var ___emscripten_embedded_file_data = Module["___emscripten_embedded_file_data"] = 237536;
 
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
