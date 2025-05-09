@@ -19,7 +19,7 @@ import {
   Select,
   Slider,
   Stack,
-  TextField
+  TextField,
 } from '@mui/material'
 import { VolumeMute, VolumeUp } from '@mui/icons-material'
 import { CartesianGrid, LineChart, XAxis, YAxis, Line, Legend } from 'recharts'
@@ -31,13 +31,15 @@ import { Program, Service } from 'mirakurun/api'
 import { useRouter } from 'next/router'
 
 const Caption = dynamic(() => import('../components/caption'), {
-  ssr: false
+  ssr: false,
 })
 
 declare interface EpgRecordedFile {
   id: number
   filename: string
 }
+
+let initialized = false;
 
 const Page: NextPage = () => {
   const router = useRouter()
@@ -48,10 +50,7 @@ const Page: NextPage = () => {
   const [drawer, setDrawer] = useState<boolean>(true)
   const [touched, setTouched] = useState<boolean>(false)
 
-  const [mirakurunServer, setMirakurunServer] = useLocalStorage<string>(
-    'mirakurunServer',
-    ''
-  )
+  const [mirakurunServer, setMirakurunServer] = useLocalStorage<string>('mirakurunServer', '')
   const [mirakurunOk, setMirakurunOk] = useState<boolean>(false)
   const [mirakurunVersion, setMirakurunVersion] = useState<string>('unknown')
   const [tvServices, setTvServices] = useState<Array<Service>>([])
@@ -68,15 +67,10 @@ const Page: NextPage = () => {
   )
   const [epgStationOk, setEpgStationOk] = useState<boolean>(false)
   const [epgStationVersion, setEpgStationVersion] = useState<string>('unknown')
-  const [epgRecordedFiles, setEpgRecordedFiles] = useState<
-    Array<EpgRecordedFile>
-  >()
+  const [epgRecordedFiles, setEpgRecordedFiles] = useState<Array<EpgRecordedFile>>()
   const [activeRecordedFileId, setActiveRecordedFileId] = useState<number>()
   const [playMode, setPlayMode] = useState<string>('live')
-  const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>(
-    'tsplayerDualMonoMode',
-    0
-  )
+  const [dualMonoMode, setDualMonoMode] = useLocalStorage<number>('tsplayerDualMonoMode', 0)
   const [volume, setVolume] = useLocalStorage<number>('tsplayerVolume', 1.0)
   const [mute, setMute] = useLocalStorage<boolean>('tsplayerMute', false)
 
@@ -87,58 +81,62 @@ const Page: NextPage = () => {
       VideoFrameQueueSize: 0,
       AudioFrameQueueSize: 0,
       InputBufferSize: 0,
-      SDLQueuedAudioSize: 0
-    }
+      SDLQueuedAudioSize: 0,
+    },
   ])
   const [showCharts, setShowCharts] = useState<boolean>(false)
-  const [showCaption, setShowCaption] = useLocalStorage<boolean>(
-    'tsplayerShowCaption',
-    false
-  )
+  const [showCaption, setShowCaption] = useLocalStorage<boolean>('tsplayerShowCaption', false)
 
   const videoCanvasRef = useRef<HTMLCanvasElement>(null)
   const captionCanvasRef = useRef<HTMLCanvasElement>(null)
 
   const [wakeLock, setWakeLock] = useState<WakeLockSentinel>()
+  const [wasmMod, setWasmMod] = useState<WasmModule | null>(null)
 
-  const wasmModuleState = useAsync(async () => {
-    const adapter = await (navigator as any).gpu.requestAdapter()
-    const device = await adapter.requestDevice()
-    const mod = await new Promise<WasmModule>(resolve => {
+  useEffect(() => {
+    let mounted = true;
+    console.log("useEffect", initialized)
+    if (initialized) {
+      return
+    }
+    initialized = true;
+    ;(async () => {
+      console.log("async", wasmMod, initialized)
+
+      const adapter = await (navigator as any).gpu.requestAdapter()
+      const device = await adapter.requestDevice()
       const script = document.createElement('script')
       script.onload = () => {
+        console.log("onload")
         ;(window as any)
           .createWasmModule({ preinitializedWebGPUDevice: device })
           .then((m: WasmModule) => {
             console.log('then', m)
-            resolve(m)
+            console.log("setWasmMod")
+            setWasmMod(m)
           })
       }
-      script.src = '/wasm/ts-live.js'
+      script.src = "/wasm/ts-live.js"
       document.head.appendChild(script)
-      console.log('script element created')
-    })
-    console.log('mod', mod)
-    console.log('PROCESS env:', process.env)
-    // mod.setLogLevelDebug()
-    return mod
-  }, [])
+      console.log("script element created")
+    })();
+}, [])
 
   useEffect(() => {
-    if (!wasmModuleState.value) return
+    if (!wasmMod) return
     if (dualMonoMode === undefined) return
-    wasmModuleState.value.setDualMonoMode(dualMonoMode)
-  }, [wasmModuleState, dualMonoMode])
+    wasmMod.setDualMonoMode(dualMonoMode)
+  }, [wasmMod, dualMonoMode])
 
   useEffect(() => {
-    if (!wasmModuleState.value) return
+    if (!wasmMod) return
     if (debugLog === undefined) return
     if (debugLog) {
-      wasmModuleState.value.setLogLevelDebug()
+      wasmMod.setLogLevelDebug()
     } else {
-      wasmModuleState.value.setLogLevelInfo()
+      wasmMod.setLogLevelInfo()
     }
-  }, [wasmModuleState, debugLog])
+  }, [wasmMod, debugLog])
 
   // const canvasProviderState = useAsync(async () => {
   //   const CanvasProvider = await import('aribb24.js').then(
@@ -146,7 +144,7 @@ const Page: NextPage = () => {
   //   )
   //   return CanvasProvider
   // })
-  const statsCallback = useCallback(function statsCallbackFunc (statsDataList: StatsData[]) {
+  const statsCallback = useCallback(function statsCallbackFunc(statsDataList: StatsData[]) {
     setChartData(prev => {
       if (prev.length + statsDataList.length > 300) {
         const overLength = prev.length + statsDataList.length - 300
@@ -212,10 +210,7 @@ const Page: NextPage = () => {
     })
   }, [mirakurunOk, mirakurunServer])
 
-  const findCurrentProgram = (
-    programs: Array<Program>,
-    activeService: Service
-  ) => {
+  const findCurrentProgram = (programs: Array<Program>, activeService: Service) => {
     const currentTime = Date.now()
     const current = programs.find(v => {
       if (
@@ -263,9 +258,7 @@ const Page: NextPage = () => {
 
   useEffect(() => {
     if (!epgStationServer || !epgStationOk) return
-    fetch(
-      `${epgStationServer}/api/recorded?isHalfWidth=false&offset=0&limit=30`
-    )
+    fetch(`${epgStationServer}/api/recorded?isHalfWidth=false&offset=0&limit=30`)
       .then(response => {
         if (response.ok && response.body !== null) {
           return response.json().then(ret => {
@@ -293,23 +286,14 @@ const Page: NextPage = () => {
       return
     }
     if (!mirakurunOk || !mirakurunServer || !activeService) {
-      console.log(
-        'mirakurunServer or activeService',
-        mirakurunOk,
-        mirakurunServer,
-        activeService
-      )
+      console.log('mirakurunServer or activeService', mirakurunOk, mirakurunServer, activeService)
       return
     }
-    if (
-      wasmModuleState.loading ||
-      wasmModuleState.error ||
-      !wasmModuleState.value
-    ) {
-      console.log('WasmModule not loaded', wasmModuleState.error)
+    if (!wasmMod) {
+      console.log('WasmModule not loaded', wasmMod)
       return
     }
-    const Module = wasmModuleState.value
+    const Module = wasmMod
     // 現在の再生中を止める（or 何もしない）
     stopFunc()
 
@@ -344,23 +328,31 @@ const Page: NextPage = () => {
         console.log('start fetch', url, Module)
         fetch(url, {
           signal: ac.signal,
-          headers: { 'X-Mirakurun-Priority': '0' }
+          headers: { 'X-Mirakurun-Priority': '0' },
         })
           .then(async response => {
             if (!response.body) {
               console.error('response body is not supplied.')
               return
             }
+            const sleep = (msec: number) => new Promise(resolve => setTimeout(resolve, msec))
             const reader = response.body.getReader()
             let ret = await reader.read()
             while (!ret.done) {
               if (ret.value) {
                 try {
-                  const buffer = Module.getNextInputBuffer(ret.value.length)
-                  buffer.set(ret.value)
-                  // console.debug('calling enqueueData', chunk.length)
-                  Module.commitInputData(ret.value.length)
-                  // console.debug('enqueData done.')
+                  while (true) {
+                    const buffer = Module.getNextInputBuffer(ret.value.length)
+                    if (!buffer) {
+                      await sleep(100)
+                      continue
+                    }
+                    buffer.set(ret.value)
+                    // console.debug('calling enqueueData', chunk.length)
+                    Module.commitInputData(ret.value.length)
+                    // console.debug('enqueData done.')
+                    break
+                  }
                 } catch (ex) {
                   if (typeof ex === 'number') {
                     console.error(Module.getExceptionMsg(ex))
@@ -381,7 +373,7 @@ const Page: NextPage = () => {
         const url = `${epgStationServer}/api/videos/${activeRecordedFileId}`
         Module.playFile(url)
       }
-    }, 200)
+    }, 500)
   }, [
     touched,
     mirakurunOk,
@@ -389,7 +381,7 @@ const Page: NextPage = () => {
     activeService,
     activeRecordedFileId,
     playMode,
-    wasmModuleState
+    wasmMod,
   ])
 
   useKey(
@@ -437,10 +429,10 @@ const Page: NextPage = () => {
   }, [epgRecordedFiles, activeRecordedFileId])
 
   useEffect(() => {
-    if (!wasmModuleState.value) return
+    if (!wasmMod) return
     if (volume === undefined) return
-    wasmModuleState.value.setAudioGain(mute ? 0.0 : volume)
-  }, [wasmModuleState, volume, mute])
+    wasmMod.setAudioGain(mute ? 0.0 : volume)
+  }, [wasmMod, volume, mute])
 
   return (
     <Box
@@ -454,15 +446,14 @@ const Page: NextPage = () => {
     >
       <Head>
         <title>
-          TS-Live!{' '}
-          {currentProgram && currentProgram.name && `| ${currentProgram.name}`}
+          TS-Live! {currentProgram && currentProgram.name && `| ${currentProgram.name}`}
         </title>
       </Head>
       <Script
-        src='https://www.googletagmanager.com/gtag/js?id=G-SR7L1XYNV0'
-        strategy='afterInteractive'
+        src="https://www.googletagmanager.com/gtag/js?id=G-SR7L1XYNV0"
+        strategy="afterInteractive"
       />
-      <Script id='google-analytics' strategy='afterInteractive'>
+      <Script id="google-analytics" strategy="afterInteractive">
         {`
             window.dataLayer = window.dataLayer || [];
             function gtag(){window.dataLayer.push(arguments);}
@@ -472,7 +463,7 @@ const Page: NextPage = () => {
           `}
       </Script>
       <Drawer
-        anchor='left'
+        anchor="left"
         open={drawer}
         onClose={() => {
           if (mirakurunOk) {
@@ -503,8 +494,8 @@ const Page: NextPage = () => {
           ></Divider>
           <FormGroup>
             <TextField
-              label='Mirakurun Server'
-              placeholder='http://mirakurun:40772'
+              label="Mirakurun Server"
+              placeholder="http://mirakurun:40772"
               css={css`
                 width: 100%;
               `}
@@ -518,9 +509,7 @@ const Page: NextPage = () => {
                 margin-top: 16px;
               `}
             >
-              {mirakurunOk
-                ? `Mirakurun: OK (version: ${mirakurunVersion})`
-                : 'Mirakurun: NG'}
+              {mirakurunOk ? `Mirakurun: OK (version: ${mirakurunVersion})` : 'Mirakurun: NG'}
             </div>
           </FormGroup>
           <FormGroup>
@@ -531,25 +520,18 @@ const Page: NextPage = () => {
                 width: 100%;
               `}
             >
-              <InputLabel id='services-label'>Services</InputLabel>
+              <InputLabel id="services-label">Services</InputLabel>
               <Select
                 css={css`
                   width: 100%;
                 `}
-                label='Services'
-                labelId='services-label'
+                label="Services"
+                labelId="services-label"
                 defaultValue={
-                  activeService
-                    ? activeService.id
-                    : tvServices.length > 0
-                    ? tvServices[0].id
-                    : null
+                  activeService ? activeService.id : tvServices.length > 0 ? tvServices[0].id : null
                 }
                 onChange={ev => {
-                  if (
-                    ev.target.value !== null &&
-                    typeof (ev.target.value === 'number')
-                  ) {
+                  if (ev.target.value !== null && typeof (ev.target.value === 'number')) {
                     const id = ev.target.value
                     const active = tvServices.find(v => v.id === id)
                     if (active) setActiveService(active)
@@ -570,15 +552,10 @@ const Page: NextPage = () => {
                 width: 100%;
               `}
             >
-              <Stack
-                spacing={2}
-                direction='row'
-                sx={{ mb: 1 }}
-                alignItems='center'
-              >
+              <Stack spacing={2} direction="row" sx={{ mb: 1 }} alignItems="center">
                 <Button
-                  size='small'
-                  variant='outlined'
+                  size="small"
+                  variant="outlined"
                   css={css`
                     padding: 3px 3px;
                     min-width: 32px;
@@ -588,13 +565,13 @@ const Page: NextPage = () => {
                   {mute ? <VolumeMute /> : <VolumeUp />}
                 </Button>
                 <Slider
-                  aria-label='Volume'
+                  aria-label="Volume"
                   min={0}
                   max={2}
                   step={0.05}
                   value={mute ? 0 : volume}
                   disabled={mute}
-                  valueLabelDisplay='auto'
+                  valueLabelDisplay="auto"
                   onChange={(ev, val) => {
                     if (typeof val === 'number') setVolume(val)
                   }}
@@ -609,19 +586,16 @@ const Page: NextPage = () => {
               width: 100%;
             `}
           >
-            <InputLabel id='dualmonomode-label'>音声 主/副</InputLabel>
+            <InputLabel id="dualmonomode-label">音声 主/副</InputLabel>
             <Select
               css={css`
                 width: 100%;
               `}
-              label='音声 0主/副'
-              labelId='dualmonomode-label'
+              label="音声 0主/副"
+              labelId="dualmonomode-label"
               value={dualMonoMode}
               onChange={ev => {
-                if (
-                  ev.target.value !== null &&
-                  typeof ev.target.value === 'number'
-                ) {
+                if (ev.target.value !== null && typeof ev.target.value === 'number') {
                   setDualMonoMode(ev.target.value)
                 }
               }}
@@ -640,7 +614,7 @@ const Page: NextPage = () => {
                   }}
                 ></Checkbox>
               }
-              label='字幕を表示する'
+              label="字幕を表示する"
             ></FormControlLabel>
           </FormGroup>
           {debug ? (
@@ -652,8 +626,8 @@ const Page: NextPage = () => {
               ></Divider>
               <FormGroup>
                 <TextField
-                  label='EPGStation Server'
-                  placeholder='http://epgstation:8888'
+                  label="EPGStation Server"
+                  placeholder="http://epgstation:8888"
                   css={css`
                     width: 100%;
                   `}
@@ -676,23 +650,16 @@ const Page: NextPage = () => {
                     width: 100%;
                   `}
                 >
-                  <InputLabel id='program-files-label'>録画ファイル</InputLabel>
+                  <InputLabel id="program-files-label">録画ファイル</InputLabel>
                   <Select
                     css={css`
                       width: 100%;
                     `}
-                    label='ProgramFiles'
-                    labelId='program-files-label'
-                    value={
-                      activeRecordedFileId !== undefined
-                        ? activeRecordedFileId
-                        : ''
-                    }
+                    label="ProgramFiles"
+                    labelId="program-files-label"
+                    value={activeRecordedFileId !== undefined ? activeRecordedFileId : ''}
                     onChange={ev => {
-                      if (
-                        ev.target.value !== null &&
-                        typeof ev.target.value === 'number'
-                      ) {
+                      if (ev.target.value !== null && typeof ev.target.value === 'number') {
                         setActiveRecordedFileId(ev.target.value)
                         setPlayMode('file')
                       }
@@ -710,26 +677,23 @@ const Page: NextPage = () => {
                     width: 100%;
                   `}
                 >
-                  <InputLabel id='playmode-label'>再生モード</InputLabel>
+                  <InputLabel id="playmode-label">再生モード</InputLabel>
                   <Select
                     css={css`
                       width: 100%;
                     `}
-                    label='再生モード'
-                    labelId='playmode-label'
+                    label="再生モード"
+                    labelId="playmode-label"
                     value={playMode}
                     onChange={ev => {
-                      if (
-                        ev.target.value !== null &&
-                        typeof ev.target.value === 'string'
-                      ) {
+                      if (ev.target.value !== null && typeof ev.target.value === 'string') {
                         setPlayMode(ev.target.value)
                       }
                     }}
                   >
-                    <MenuItem value='live'>ライブ視聴</MenuItem>
+                    <MenuItem value="live">ライブ視聴</MenuItem>
                     {activeRecordedFileId !== undefined && (
-                      <MenuItem value='file'>ファイル再生</MenuItem>
+                      <MenuItem value="file">ファイル再生</MenuItem>
                     )}
                   </Select>
                 </FormControl>
@@ -742,14 +706,14 @@ const Page: NextPage = () => {
                       onChange={ev => {
                         setShowCharts(ev.target.checked)
                         if (ev.target.checked) {
-                          wasmModuleState.value?.setStatsCallback(statsCallback)
+                          wasmMod?.setStatsCallback(statsCallback)
                         } else {
-                          wasmModuleState.value?.setStatsCallback(null)
+                          wasmMod?.setStatsCallback(null)
                         }
                       }}
                     ></Checkbox>
                   }
-                  label='統計グラフを表示する'
+                  label="統計グラフを表示する"
                 ></FormControlLabel>
               </FormGroup>
               <FormGroup>
@@ -762,7 +726,7 @@ const Page: NextPage = () => {
                       }}
                     ></Checkbox>
                   }
-                  label='デバッグログを出力する'
+                  label="デバッグログを出力する"
                 ></FormControlLabel>
               </FormGroup>
             </div>
@@ -787,7 +751,7 @@ const Page: NextPage = () => {
             max-height: 100%;
             z-index: 1;
           `}
-          id='video'
+          id="video"
           ref={videoCanvasRef}
           tabIndex={-1}
           width={1920}
@@ -796,13 +760,13 @@ const Page: NextPage = () => {
           onContextMenu={ev => ev.preventDefault()}
           // transformはWasmが書き換えるので要素のタグに直接書くこと
           style={{
-            transform: 'translate(-50%, -50%)'
+            transform: 'translate(-50%, -50%)',
           }}
         ></canvas>
         <div hidden={!showCaption}>
           <Caption
             service={activeService}
-            wasmModule={wasmModuleState.value}
+            wasmModule={wasmMod!}
             canvasRef={captionCanvasRef}
             width={1920}
             height={1080}
@@ -845,86 +809,70 @@ const Page: NextPage = () => {
               `}
             >
               <CartesianGrid strokeDasharray={'3 3'} />
-              <XAxis dataKey='time' />
+              <XAxis dataKey="time" />
               <YAxis />
               <Legend />
               <Line
-                type='linear'
-                dataKey='VideoFrameQueueSize'
-                name='Video Queue Size'
-                stroke='#8884d8'
+                type="linear"
+                dataKey="VideoFrameQueueSize"
+                name="Video Queue Size"
+                stroke="#8884d8"
                 isAnimationActive={false}
                 dot={false}
               />
             </LineChart>
-            <LineChart
-              width={550}
-              height={250}
-              data={showCharts ? chartData : []}
-            >
+            <LineChart width={550} height={250} data={showCharts ? chartData : []}>
               <CartesianGrid strokeDasharray={'3 3'} />
-              <XAxis dataKey='time' />
+              <XAxis dataKey="time" />
               <YAxis />
               <Legend />
               <Line
-                type='linear'
-                dataKey='AudioFrameQueueSize'
-                name='Audio Queue Size'
-                stroke='#82ca9d'
+                type="linear"
+                dataKey="AudioFrameQueueSize"
+                name="Audio Queue Size"
+                stroke="#82ca9d"
                 isAnimationActive={false}
                 dot={false}
               />
             </LineChart>
-            <LineChart
-              width={550}
-              height={250}
-              data={showCharts ? chartData : []}
-            >
+            <LineChart width={550} height={250} data={showCharts ? chartData : []}>
               <CartesianGrid strokeDasharray={'3 3'} />
-              <XAxis dataKey='time' />
+              <XAxis dataKey="time" />
               <YAxis />
               <Legend />
               <Line
-                type='linear'
-                dataKey='CaptionDataQueueSize'
-                name='Caption Data Size'
-                stroke='#9dca82'
+                type="linear"
+                dataKey="CaptionDataQueueSize"
+                name="Caption Data Size"
+                stroke="#9dca82"
                 isAnimationActive={false}
                 dot={false}
               />
             </LineChart>
-            <LineChart
-              width={550}
-              height={250}
-              data={showCharts ? chartData : []}
-            >
+            <LineChart width={550} height={250} data={showCharts ? chartData : []}>
               <CartesianGrid strokeDasharray={'3 3'} />
-              <XAxis dataKey='time' />
+              <XAxis dataKey="time" />
               <YAxis />
               <Legend />
               <Line
-                type='linear'
-                dataKey='AudioWorkletBufferSize'
-                name='AudioWorklet Buffer Size'
-                stroke='#9d82ca'
+                type="linear"
+                dataKey="AudioWorkletBufferSize"
+                name="AudioWorklet Buffer Size"
+                stroke="#9d82ca"
                 isAnimationActive={false}
                 dot={false}
               />
             </LineChart>
-            <LineChart
-              width={550}
-              height={250}
-              data={showCharts ? chartData : []}
-            >
+            <LineChart width={550} height={250} data={showCharts ? chartData : []}>
               <CartesianGrid strokeDasharray={'3 3'} />
-              <XAxis dataKey='time' />
+              <XAxis dataKey="time" />
               <YAxis />
               <Legend />
               <Line
-                type='linear'
-                dataKey='InputBufferSize'
-                name='Input Buffer Size'
-                stroke='#ca829d'
+                type="linear"
+                dataKey="InputBufferSize"
+                name="Input Buffer Size"
+                stroke="#ca829d"
                 isAnimationActive={false}
                 dot={false}
               />

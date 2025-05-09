@@ -368,13 +368,11 @@ void drawWebGpu(AVFrame *frame) {
   colorDesc.view = backBufView;
   colorDesc.loadOp = WGPULoadOp_Clear;
   colorDesc.storeOp = WGPUStoreOp_Store;
+  colorDesc.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
   colorDesc.clearValue.r = 0.0f;
   colorDesc.clearValue.g = 0.0f;
   colorDesc.clearValue.b = 0.0f;
   colorDesc.clearValue.a = 1.0f;
-#ifndef WEBGPU_BACKEND_WGPU
-  colorDesc.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-#endif
 
   WGPUComputePassDescriptor compPassDesc = {};
 

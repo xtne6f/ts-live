@@ -1,0 +1,39 @@
+server:
+  addrs:
+    - http: 0.0.0.0:40772
+
+epg:
+  cache-dir: /var/lib/mirakc/epg
+
+channels:
+  - name: ダミー1
+    type: GR
+    channel: 1
+  - name: ダミー2
+    type: GR
+    channel: 2
+  - name: ダミー3
+    type: GR
+    channel: 3
+
+tuners:
+  - name: ダミー1
+    types:
+      - GR
+    command:
+      tsp
+        --add-input-stuffing  4/1
+        -I file --infinite /data/{{{channel}}}.ts
+        -P reduce --target-bitrate 30000000
+        -P filter -n --pid 0x500-0xfff
+        -P continuity --fix
+        -P sdt --original-network-id 0x00{{{channel}}}
+        -P timeref --eit --start system
+        -P svrename --japan --name ダミー{{{channel}}}
+        -P regulate --bitrate 30000000 --packet-burst 32
+        -P filter -n --pid 0x1fff
+
+
+jobs:
+  update-schedules:
+    disabled: true

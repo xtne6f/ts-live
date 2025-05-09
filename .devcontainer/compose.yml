@@ -1,0 +1,25 @@
+services:
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../..:/workspaces:cached
+    command: sleep infinity
+    env_file: .env
+  mirakc:
+    image: ghcr.io/kounoike/dtv-dummy-server/mirakc:latest
+    # build:
+    #   context: ./mirakc
+    #   dockerfile: Dockerfile
+    volumes:
+      - ./data:/data
+    env_file: .env
+    environment:
+      - TZ=Asia/Tokyo
+      - MIRAKC_DEBUG_CHILD_PROCESS=1
+      - MIRAKC_ARIB_LOG=warn,filter-program=debug
+
+volumes:
+  mirakc-data:
+    driver: local

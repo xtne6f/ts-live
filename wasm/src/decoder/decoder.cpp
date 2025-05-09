@@ -324,12 +324,13 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
       int bufferSize = av_image_get_buffer_size((AVPixelFormat)frame->format,
                                                 frame->width, frame->height, 1);
       spdlog::debug("VideoFrame: {}x{}x{} pixfmt:{} key:{} interlace:{} "
-                    "tff:{} codecContext->field_order:{} pts:{} "
+                    "tff:{} codecContext->field_order:?? pts:{} "
                     "stream.timebase:{} bufferSize:{}",
-                    frame->width, frame->height, frame->channels, frame->format,
-                    frame->key_frame, frame->interlaced_frame,
-                    frame->top_field_first, videoCodecContext->field_order,
-                    frame->pts, av_q2d(videoStream->time_base), bufferSize);
+                    frame->width, frame->height, frame->ch_layout.nb_channels,
+                    frame->format, frame->flags & AV_FRAME_FLAG_KEY,
+                    frame->flags & AV_FRAME_FLAG_INTERLACED,
+                    frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST, frame->pts,
+                    av_q2d(videoStream->time_base), bufferSize);
       if (desc == nullptr) {
         spdlog::debug("desc is NULL");
       } else {
@@ -361,8 +362,6 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
     av_packet_free(&ppacket);
   }
 
-  spdlog::debug("closing videoCodecContext");
-  avcodec_close(videoCodecContext);
   spdlog::debug("freeing videoCodecContext");
   avcodec_free_context(&videoCodecContext);
 }
@@ -488,12 +487,12 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
     while (avcodec_receive_frame(audioCodecContext, frame) == 0) {
       spdlog::debug("AudioFrame: format:{} pts:{} frame timebase:{} stream "
                     "timebase:{} buf[0].size:{} buf[1].size:{} nb_samples:{} "
-                    "ch:{} ch_layout:{:016x}",
+                    "ch:{}",
                     frame->format, frame->pts, av_q2d(frame->time_base),
                     av_q2d(audioStreamList[0]->time_base),
                     frame->buf[0] ? frame->buf[0]->size : 0,
                     frame->buf[1] ? frame->buf[1]->size : 0, frame->nb_samples,
-                    frame->channels, frame->channel_layout);
+                    frame->ch_layout.nb_channels);
       if (initPts < 0) {
         initPts = frame->pts;
       }
@@ -574,8 +573,6 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
   }
   av_frame_free(&filtFrame);
   avfilter_graph_free(&filterGraph);
-  spdlog::debug("closing audioCodecContext");
-  avcodec_close(audioCodecContext);
   spdlog::debug("freeing videoCodecContext");
   avcodec_free_context(&audioCodecContext);
 }
@@ -625,10 +622,9 @@ void decoderThreadFunc() {
     // find video/audio/caption stream
     for (int i = 0; i < (int)formatContext->nb_streams; ++i) {
       spdlog::debug(
-          "stream[{}]: codec_type:{} tag:{:x} codecName:{} video_delay:{} "
+          "stream[{}]: tag:{:x} codecName:{} video_delay:{} "
           "dim:{}x{}",
-          i, formatContext->streams[i]->codecpar->codec_type,
-          formatContext->streams[i]->codecpar->codec_tag,
+          i, formatContext->streams[i]->codecpar->codec_tag,
           avcodec_get_name(formatContext->streams[i]->codecpar->codec_id),
           formatContext->streams[i]->codecpar->video_delay,
           formatContext->streams[i]->codecpar->width,
@@ -659,28 +655,26 @@ void decoderThreadFunc() {
       spdlog::error("No audio stream ...");
       return;
     }
-    spdlog::info("Found video stream index:{} codec:{}={} dim:{}x{} "
-                 "colorspace:{}={} colorrange:{}={} delay:{}",
-                 videoStream->index, videoStream->codecpar->codec_id,
+    spdlog::info("Found video stream index:{} codec:{} dim:{}x{} "
+                 "colorspace:{} colorrange:{} delay:{}",
+                 videoStream->index,
                  avcodec_get_name(videoStream->codecpar->codec_id),
                  videoStream->codecpar->width, videoStream->codecpar->height,
-                 videoStream->codecpar->color_space,
                  av_color_space_name(videoStream->codecpar->color_space),
-                 videoStream->codecpar->color_range,
                  av_color_range_name(videoStream->codecpar->color_range),
                  videoStream->codecpar->video_delay);
     for (auto &&audioStream : audioStreamList) {
-      spdlog::info("Found audio stream index:{} codecID:{}={} channels:{} "
+      spdlog::info("Found audio stream index:{} codecID:{} channels:{} "
                    "sample_rate:{}",
-                   audioStream->index, audioStream->codecpar->codec_id,
+                   audioStream->index,
                    avcodec_get_name(audioStream->codecpar->codec_id),
-                   audioStream->codecpar->channels,
+                   audioStream->codecpar->ch_layout.nb_channels,
                    audioStream->codecpar->sample_rate);
     }
 
     if (captionStream) {
-      spdlog::info("Found caption stream index:{} codecID:{}={}",
-                   captionStream->index, captionStream->codecpar->codec_id,
+      spdlog::info("Found caption stream index:{} codecID:{}",
+                   captionStream->index,
                    avcodec_get_name(captionStream->codecpar->codec_id));
     }
   }
@@ -957,7 +951,7 @@ void decoderMainloop() {
     }
     spdlog::debug("AudioFrame@mainloop pts:{} time_base:{} nb_samples:{} ch:{}",
                   frame->pts, av_q2d(frame->time_base), frame->nb_samples,
-                  frame->channels);
+                  frame->ch_layout.nb_channels);
 
     if (frame->sample_rate == 48000 && frame->format == AV_SAMPLE_FMT_FLTP &&
         frame->channel_layout == AV_CH_LAYOUT_STEREO && frame->channels == 2) {
