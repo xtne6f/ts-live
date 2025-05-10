@@ -19,6 +19,7 @@ extern "C" {
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/bprint.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
@@ -368,7 +369,7 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
 
 AVFilterGraph *allocAudioFilterGraph(double tempo, int sampleRate,
                                      AVSampleFormat format,
-                                     uint64_t channelLayout,
+                                     const AVChannelLayout &chLayout,
                                      AVFilterContext *&abufferContext,
                                      AVFilterContext *&abuffersinkContext) {
   const AVFilter *abuffer = avfilter_get_by_name("abuffer");
@@ -384,33 +385,40 @@ AVFilterGraph *allocAudioFilterGraph(double tempo, int sampleRate,
   }
 
   AVFilterContext *aformatContext;
-  std::string args =
-      fmt::format("sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
-                  sampleRate, av_get_sample_fmt_name(format), channelLayout);
-  if (avfilter_graph_create_filter(&abufferContext, abuffer, "af_in",
-                                   args.c_str(), nullptr, graph) >= 0 &&
-      avfilter_graph_create_filter(&abuffersinkContext, abuffersink, "af_out",
-                                   nullptr, nullptr, graph) >= 0 &&
-      avfilter_graph_create_filter(
-          &aformatContext, aformat, "af_format",
-          "sample_rates=48000:sample_fmts=fltp:channel_layouts=stereo", nullptr,
-          graph) >= 0) {
-    if (tempo != 1.0) {
-      // atempoフィルタを挟む
-      AVFilterContext *atempoContext;
-      if (avfilter_graph_create_filter(&atempoContext, atempo, "af_tempo",
-                                       fmt::format("{}", tempo).c_str(),
-                                       nullptr, graph) >= 0 &&
-          avfilter_link(abufferContext, 0, atempoContext, 0) >= 0 &&
-          avfilter_link(atempoContext, 0, aformatContext, 0) >= 0 &&
-          avfilter_link(aformatContext, 0, abuffersinkContext, 0) >= 0 &&
-          avfilter_graph_config(graph, nullptr) >= 0) {
+  AVBPrint desc;
+  av_bprint_init(&desc, 0, AV_BPRINT_SIZE_UNLIMITED);
+  if (av_channel_layout_describe_bprint(&chLayout, &desc) < 0) {
+    av_bprint_finalize(&desc, nullptr);
+  } else {
+    std::string args =
+        fmt::format("sample_rate={}:sample_fmt={}:channel_layout={}",
+                    sampleRate, av_get_sample_fmt_name(format), desc.str);
+    av_bprint_finalize(&desc, nullptr);
+    if (avfilter_graph_create_filter(&abufferContext, abuffer, "af_in",
+                                     args.c_str(), nullptr, graph) >= 0 &&
+        avfilter_graph_create_filter(&abuffersinkContext, abuffersink, "af_out",
+                                     nullptr, nullptr, graph) >= 0 &&
+        avfilter_graph_create_filter(
+            &aformatContext, aformat, "af_format",
+            "sample_rates=48000:sample_fmts=fltp:channel_layouts=stereo",
+            nullptr, graph) >= 0) {
+      if (tempo != 1.0) {
+        // atempoフィルタを挟む
+        AVFilterContext *atempoContext;
+        if (avfilter_graph_create_filter(&atempoContext, atempo, "af_tempo",
+                                         fmt::format("{}", tempo).c_str(),
+                                         nullptr, graph) >= 0 &&
+            avfilter_link(abufferContext, 0, atempoContext, 0) >= 0 &&
+            avfilter_link(atempoContext, 0, aformatContext, 0) >= 0 &&
+            avfilter_link(aformatContext, 0, abuffersinkContext, 0) >= 0 &&
+            avfilter_graph_config(graph, nullptr) >= 0) {
+          return graph;
+        }
+      } else if (avfilter_link(abufferContext, 0, aformatContext, 0) >= 0 &&
+                 avfilter_link(aformatContext, 0, abuffersinkContext, 0) >= 0 &&
+                 avfilter_graph_config(graph, nullptr) >= 0) {
         return graph;
       }
-    } else if (avfilter_link(abufferContext, 0, aformatContext, 0) >= 0 &&
-               avfilter_link(aformatContext, 0, abuffersinkContext, 0) >= 0 &&
-               avfilter_graph_config(graph, nullptr) >= 0) {
-      return graph;
     }
   }
   avfilter_graph_free(&graph);
@@ -454,7 +462,9 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
   bool reallocGraph = true;
   int currentSampleRate = 0;
   int currentFormat = -1;
-  uint64_t currentChannelLayout = 0;
+  AVChannelLayout currentChLayout = {};
+  AVChannelLayout defaultStereoChLayout;
+  av_channel_layout_default(&defaultStereoChLayout, 2);
   AVFilterGraph *filterGraph = nullptr;
   AVFilterContext *abufferContext = nullptr;
   AVFilterContext *abuffersinkContext = nullptr;
@@ -500,15 +510,16 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
       if (videoFrameFound) {
         if (currentSampleRate != frame->sample_rate ||
             currentFormat != frame->format ||
-            currentChannelLayout != frame->channel_layout) {
-          spdlog::info(
-              "AudioFrame {}: sample_rate:{}->{} layout:0x{:x}->0x{:x}",
-              currentFormat < 0 ? "Received initially" : "Changed",
-              currentSampleRate, frame->sample_rate, currentChannelLayout,
-              frame->channel_layout);
+            av_channel_layout_compare(&currentChLayout, &frame->ch_layout) ==
+                1) {
+          spdlog::info("AudioFrame {}: sample_rate:{}->{} ch:{}->{}",
+                       currentFormat < 0 ? "Received initially" : "Changed",
+                       currentSampleRate, frame->sample_rate,
+                       currentChLayout.nb_channels,
+                       frame->ch_layout.nb_channels);
           currentSampleRate = frame->sample_rate;
           currentFormat = frame->format;
-          currentChannelLayout = frame->channel_layout;
+          av_channel_layout_copy(&currentChLayout, &frame->ch_layout);
           reallocGraph = true;
         }
         if (reallocGraph) {
@@ -517,19 +528,21 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
           if (currentAudioTempo != 1.0) {
             filterGraph = allocAudioFilterGraph(
                 currentAudioTempo, currentSampleRate,
-                (AVSampleFormat)currentFormat, currentChannelLayout,
-                abufferContext, abuffersinkContext);
+                (AVSampleFormat)currentFormat, currentChLayout, abufferContext,
+                abuffersinkContext);
             if (!filterGraph) {
               spdlog::error("allocAudioFilterGraph({}) failed",
                             currentAudioTempo);
             }
           }
-          if (!filterGraph && (currentSampleRate != 48000 ||
-                               currentFormat != AV_SAMPLE_FMT_FLTP ||
-                               currentChannelLayout != AV_CH_LAYOUT_STEREO)) {
+          if (!filterGraph &&
+              (currentSampleRate != 48000 ||
+               currentFormat != AV_SAMPLE_FMT_FLTP ||
+               av_channel_layout_compare(&currentChLayout,
+                                         &defaultStereoChLayout) == 1)) {
             filterGraph = allocAudioFilterGraph(
                 1.0, currentSampleRate, (AVSampleFormat)currentFormat,
-                currentChannelLayout, abufferContext, abuffersinkContext);
+                currentChLayout, abufferContext, abuffersinkContext);
             if (!filterGraph) {
               spdlog::error("allocAudioFilterGraph(1.0) failed");
             }
@@ -546,12 +559,12 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
               // 常にFLTP,48000Hz,stereoのはず
               spdlog::debug("AudioFrame(Filtered): format:{} pts:{} frame "
                             "timebase:{} buf[0].size:{} buf[1].size:{} "
-                            "nb_samples:{} ch:{} ch_layout:{:016x}",
+                            "nb_samples:{} ch:{}",
                             filtFrame->format, filtFrame->pts,
                             av_q2d(filtFrame->time_base),
                             filtFrame->buf[0]->size, filtFrame->buf[1]->size,
-                            filtFrame->nb_samples, filtFrame->channels,
-                            filtFrame->channel_layout);
+                            filtFrame->nb_samples,
+                            filtFrame->ch_layout.nb_channels);
               filtFrame->pts = pts;
               filtFrame->time_base = audioStreamList[0]->time_base;
               std::lock_guard<std::mutex> lock(audioPacketMtx);
@@ -573,6 +586,7 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
   }
   av_frame_free(&filtFrame);
   avfilter_graph_free(&filterGraph);
+  av_channel_layout_uninit(&currentChLayout);
   spdlog::debug("freeing videoCodecContext");
   avcodec_free_context(&audioCodecContext);
 }
@@ -954,7 +968,7 @@ void decoderMainloop() {
                   frame->ch_layout.nb_channels);
 
     if (frame->sample_rate == 48000 && frame->format == AV_SAMPLE_FMT_FLTP &&
-        frame->channel_layout == AV_CH_LAYOUT_STEREO && frame->channels == 2) {
+        frame->ch_layout.nb_channels == 2) {
       feedAudioData(reinterpret_cast<float *>(frame->data[0]),
                     reinterpret_cast<float *>(frame->data[1]),
                     frame->nb_samples);

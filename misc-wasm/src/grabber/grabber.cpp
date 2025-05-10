@@ -106,7 +106,6 @@ emscripten::val grabFirstFrame(size_t size) {
       av_packet_unref(ppacket);
     }
     av_packet_free(&ppacket);
-    avcodec_close(codecContext);
     avcodec_free_context(&codecContext);
   }
   avformat_close_input(&formatContext);
@@ -115,8 +114,10 @@ emscripten::val grabFirstFrame(size_t size) {
   if (frame) {
     spdlog::debug(
         "VideoFrame: {}x{} pixfmt:{} key:{} interlace:{} tff:{} pts:{}",
-        frame->width, frame->height, frame->format, frame->key_frame,
-        frame->interlaced_frame, frame->top_field_first, frame->pts);
+        frame->width, frame->height, frame->format,
+        frame->flags & AV_FRAME_FLAG_KEY,
+        frame->flags & AV_FRAME_FLAG_INTERLACED,
+        frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST, frame->pts);
 
     if (frame->width > 0 && frame->height > 0 &&
         frame->format == AV_PIX_FMT_YUV420P && frame->linesize[0] > 0 &&
