@@ -4,6 +4,7 @@
 #include <emscripten/bind.h>
 #include <emscripten/emscripten.h>
 #include <emscripten/fetch.h>
+#include <emscripten/html5.h>
 #include <emscripten/val.h>
 #include <mutex>
 #include <spdlog/spdlog.h>
@@ -41,7 +42,7 @@ void setLogLevelInfo() { spdlog::set_level(spdlog::level::info); }
 
 void mainloop(void *arg) {
   // mainloop
-  decoderMainloop();
+  decoderMainloop(false);
 }
 
 int main() {
@@ -55,13 +56,24 @@ int main() {
   spdlog::info("initializing webgpu");
   initWebGpu();
 
+  // requestAnimationFrameも使う。バックグラウンド状態では基本的に一時停止してしまう。
+  static bool (*const rafCb)(double, void *) = [](double time, void *userData) {
+    decoderMainloop(true);
+    long &rafID = *static_cast<long *>(userData);
+    rafID = emscripten_request_animation_frame(rafCb, &rafID);
+    return false;
+  };
+  long rafID = 0;
+  rafID = emscripten_request_animation_frame(rafCb, &rafID);
+
   // //
   // fps指定するとrAFループじゃなくタイマーになるので裏周りしても再生が続く。fps<=0だとrAFが使われるらしい。
-  const int fps = 60;
+  const int fps = 10;
   const int simulate_infinite_loop = 1;
   spdlog::info("Starting main loop.");
   emscripten_set_main_loop_arg(mainloop, NULL, fps, simulate_infinite_loop);
 
+  emscripten_cancel_animation_frame(rafID);
   // SDL_DestroyRenderer(ctx.renderer);
   // SDL_DestroyWindow(ctx.window);
   // SDL_Quit();

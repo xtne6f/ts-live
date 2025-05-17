@@ -2,7 +2,7 @@
 #include <emscripten/val.h>
 
 void initDecoder();
-void decoderMainloop();
+void decoderMainloop(bool calledByRaf);
 
 emscripten::val getNextInputBuffer(size_t nextSize);
 void commitInputData(size_t nextSize);

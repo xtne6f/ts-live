@@ -21,6 +21,7 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/bprint.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
@@ -46,7 +47,7 @@ const size_t MAX_VIDEO_FRAME_QUEUE_SIZE = 8;
 const size_t MAX_VIDEO_PACKET_QUEUE_SIZE = 60;
 
 int64_t currentPlaybackTime = 0;
-int64_t currentPlaybackPtsTime = 0;
+int64_t currentPlaybackPtsTime = -1;
 
 bool resetedDecoder = false;
 std::uint8_t inputBuffer[MAX_INPUT_BUFFER];
@@ -64,6 +65,7 @@ std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 std::deque<std::pair<int64_t, std::vector<uint8_t>>> captionDataQueue;
 std::mutex captionDataMtx;
 bool videoFrameFound = false;
+double estimatedAudioPlayTime = -1;
 
 std::deque<AVPacket *> videoPacketQueue, audioPacketQueue;
 std::mutex videoPacketMtx, audioPacketMtx;
@@ -236,6 +238,7 @@ void resetInternal() {
       videoFrameQueue.pop_front();
       av_frame_free(&frame);
     }
+    currentPlaybackPtsTime = -1;
   }
   {
     std::lock_guard<std::mutex> lock(audioPacketMtx);
@@ -295,11 +298,38 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
   spdlog::debug("avcodec for video open success.");
 
   AVFrame *frame = av_frame_alloc();
+  double ptsTimeForContinuityCheck = -1;
 
   while (!terminateFlag) {
     AVPacket *ppacket;
     {
       std::unique_lock<std::mutex> lock(videoPacketMtx);
+      // メインループの処理の頻度が下がったときにパケットが蓄積しないようにする
+      if (videoFrameQueue.size() >= MAX_VIDEO_FRAME_QUEUE_SIZE &&
+          estimatedAudioPlayTime != -1) {
+        bool showFlag = true;
+        for (AVFrame *checkFrame : videoFrameQueue) {
+          double ptsTime = checkFrame->pts * av_q2d(checkFrame->time_base);
+          showFlag = estimatedAudioPlayTime > ptsTime;
+          if (!showFlag) {
+            break;
+          }
+        }
+        // リップシンク条件を満たしたフレームでキューが一杯のとき
+        if (showFlag) {
+          // 参照中かもしれない先頭要素を残してすべてスキップする
+          while (videoFrameQueue.size() > 1) {
+            auto popFrame = videoFrameQueue.back();
+            videoFrameQueue.pop_back();
+            if (!!av_dict_get(popFrame->metadata, "ts-live.discontinuity",
+                              nullptr, 0)) {
+              // 次フレームを不連続にする
+              ptsTimeForContinuityCheck = -1;
+            }
+            av_frame_free(&popFrame);
+          }
+        }
+      }
       videoPacketCv.wait(lock, [&] {
         return (videoFrameQueue.size() < MAX_VIDEO_FRAME_QUEUE_SIZE &&
                 !videoPacketQueue.empty()) ||
@@ -352,8 +382,17 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
       frame->time_base.den = videoStream->time_base.den;
       frame->time_base.num = videoStream->time_base.num;
 
-      AVFrame *cloneFrame = av_frame_clone(frame);
-      {
+      // time_base が 0/0 な不正フレームは捨てる
+      if (frame->time_base.den != 0 && frame->time_base.num != 0) {
+        AVFrame *cloneFrame = av_frame_clone(frame);
+        double ptsTime = frame->pts * av_q2d(frame->time_base);
+        if (ptsTimeForContinuityCheck == -1 ||
+            ptsTimeForContinuityCheck < ptsTime - 1 ||
+            ptsTimeForContinuityCheck > ptsTime + 1) {
+          // 不連続であることをフレームに記録する
+          av_dict_set(&cloneFrame->metadata, "ts-live.discontinuity", "1", 0);
+        }
+        ptsTimeForContinuityCheck = ptsTime;
         std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameFound = true;
 
@@ -567,18 +606,26 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
                             filtFrame->ch_layout.nb_channels);
               filtFrame->pts = pts;
               filtFrame->time_base = audioStreamList[0]->time_base;
-              std::lock_guard<std::mutex> lock(audioPacketMtx);
-              audioFrameQueue.push_back(filtFrame);
-              filtFrame = av_frame_alloc();
+              // time_base が 0/0 な不正フレームは捨てる
+              if (filtFrame->time_base.den != 0 &&
+                  filtFrame->time_base.num != 0) {
+                AVFrame *cloneFrame = av_frame_clone(filtFrame);
+                std::lock_guard<std::mutex> lock(audioPacketMtx);
+                audioFrameQueue.push_back(cloneFrame);
+              }
+              av_frame_unref(filtFrame);
             }
           } else {
             spdlog::error("av_buffersrc_add_frame(audio) failed: {} {}", ret,
                           av_err2str(ret));
           }
         } else {
-          AVFrame *cloneFrame = av_frame_clone(frame);
-          std::lock_guard<std::mutex> lock(audioPacketMtx);
-          audioFrameQueue.push_back(cloneFrame);
+          // time_base が 0/0 な不正フレームは捨てる
+          if (frame->time_base.den != 0 && frame->time_base.num != 0) {
+            AVFrame *cloneFrame = av_frame_clone(frame);
+            std::lock_guard<std::mutex> lock(audioPacketMtx);
+            audioFrameQueue.push_back(cloneFrame);
+          }
         }
       }
     }
@@ -805,7 +852,7 @@ void initDecoder() {
   servicefilter.SetSuperimposeMode(2);
 }
 
-void decoderMainloop() {
+void decoderMainloop(bool calledByRaf) {
   spdlog::debug("decoderMainloop videoFrameQueue:{} audioFrameQueue:{} "
                 "videoPacketQueue:{} audioPacketQueue:{}",
                 videoFrameQueue.size(), audioFrameQueue.size(),
@@ -824,7 +871,7 @@ void decoderMainloop() {
     data.set("CaptionDataQueueSize",
              captionStream ? captionDataQueue.size() : 0);
     statsBuffer.push_back(std::move(data));
-    if (statsBuffer.size() >= 6) {
+    if (!calledByRaf) {
       auto statsArray = emscripten::val::array();
       for (int i = 0; i < statsBuffer.size(); i++) {
         statsArray.set(i, statsBuffer[i]);
@@ -834,43 +881,51 @@ void decoderMainloop() {
     }
   }
 
-  // time_base が 0/0 な不正フレームが入ってたら捨てる
-  AVFrame *currentFrame = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(videoPacketMtx);
-    while (!videoFrameQueue.empty()) {
-      AVFrame *frame = videoFrameQueue.front();
-      if (frame->time_base.den == 0 || frame->time_base.num == 0) {
-        videoFrameQueue.pop_front();
-        av_frame_free(&frame);
-        // キューが減ることでスレッドがデコードを再開するかもしれないため
-        videoPacketCv.notify_all();
-      } else {
-        currentFrame = frame;
-        break;
-      }
-    }
+  // requestAnimationFrameによる呼び出しが一時停止している(rafPauseCount>1)かどうか
+  static int64_t rafPauseCount = 0;
+  if (calledByRaf ? (rafPauseCount > 1) : (rafPauseCount == 1)) {
+    spdlog::debug("rafPauseCount:{}->{}", rafPauseCount,
+                  calledByRaf ? 0 : rafPauseCount + 1);
   }
-  AVFrame *audioFrame = nullptr;
-  double audioTempo;
-  {
-    std::lock_guard<std::mutex> lock(audioPacketMtx);
-    while (!audioFrameQueue.empty()) {
-      AVFrame *frame = audioFrameQueue.front();
-      if (frame->time_base.den == 0 || frame->time_base.num == 0) {
-        audioFrameQueue.pop_front();
-        av_frame_free(&frame);
-      } else {
-        audioFrame = frame;
-        break;
-      }
-    }
-    audioTempo = currentAudioTempo;
+  rafPauseCount = calledByRaf ? 0 : rafPauseCount + 1;
+  // なるべくリフレッシュレートに合わせて処理するため
+  if (!calledByRaf && rafPauseCount <= 1) {
+    return;
   }
 
-  if (currentFrame && audioFrame) {
+  AVFrame *currentFrame = nullptr;
+  {
+    // estimatedAudioPlayTimeを計算するため
+    double audioPtsTime = -1;
+    double audioTempo;
+    {
+      std::lock_guard<std::mutex> lock(audioPacketMtx);
+      if (!audioFrameQueue.empty()) {
+        // AudioのPTSをクロックから時間に直す
+        // TODO: クロック一回転したときの処理
+        audioPtsTime = audioFrameQueue.front()->pts *
+                       av_q2d(audioFrameQueue.front()->time_base);
+      }
+      audioTempo = currentAudioTempo;
+    }
+
+    std::lock_guard<std::mutex> lock(videoPacketMtx);
+    if (audioPtsTime != -1) {
+      // 上記から推定される、現在再生している音声のPTS（時間）
+      // estimatedAudioPlayTime =
+      //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
+      estimatedAudioPlayTime =
+          audioPtsTime - (double)bufferedAudioSamples * audioTempo / 48000;
+    } else {
+      estimatedAudioPlayTime = -1;
+    }
+    if (!videoFrameQueue.empty()) {
+      currentFrame = videoFrameQueue.front();
+    }
+  }
+
+  if (currentFrame && estimatedAudioPlayTime != -1) {
     // 次のVideoFrameをまずは見る（条件を満たせばpopする）
-    // AudioFrameは完全に見るだけ
     // spdlog::info("found Current Frame {}x{} bufferSize:{}",
     // currentFrame->width,
     //              currentFrame->height, bufferSize);
@@ -887,48 +942,44 @@ void decoderMainloop() {
     //   set_style(videoStream->codecpar->width);
     // }
 
-    // VideoとAudioのPTSをクロックから時間に直す
+    // VideoのPTSをクロックから時間に直す
     // TODO: クロック一回転したときの処理
     double videoPtsTime = currentFrame->pts * av_q2d(currentFrame->time_base);
-    double audioPtsTime = audioFrame->pts * av_q2d(audioFrame->time_base);
-
-    // 上記から推定される、現在再生している音声のPTS（時間）
-    // double estimatedAudioPlayTime =
-    //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
-    double estimatedAudioPlayTime =
-        audioPtsTime - (double)bufferedAudioSamples * audioTempo / 48000;
 
     // 1フレーム分くらいはズレてもいいからこれでいいか。フレーム真面目に考えると良くわからない。
     bool showFlag = estimatedAudioPlayTime > videoPtsTime;
 
     // リップシンク条件を満たしてたらVideoFrame再生
     if (showFlag) {
-      int64_t ptsTime = (int64_t)(videoPtsTime * 1000);
-      if (currentPlaybackPtsTime < ptsTime - 1000 ||
-          currentPlaybackPtsTime > ptsTime + 1000) {
-        // 不連続なのでリセット
-        currentPlaybackPtsTime = ptsTime;
-      } else if (currentPlaybackPtsTime < ptsTime) {
-        // 再生時刻を増やす
-        currentPlaybackTime += ptsTime - currentPlaybackPtsTime;
-        currentPlaybackPtsTime = ptsTime;
-      }
       {
         std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameQueue.pop_front();
         // キューが減ることでスレッドがデコードを再開するかもしれないため
         videoPacketCv.notify_all();
       }
-      double timestamp =
-          currentFrame->pts * av_q2d(currentFrame->time_base) * 1000000;
 
-      drawWebGpu(currentFrame);
+      int64_t ptsTime = (int64_t)(videoPtsTime * 1000);
+      if (currentPlaybackPtsTime == -1 ||
+          !!av_dict_get(currentFrame->metadata, "ts-live.discontinuity",
+                        nullptr, 0)) {
+        // 初期状態か不連続なのでリセット
+        currentPlaybackPtsTime = ptsTime;
+      } else if (currentPlaybackPtsTime < ptsTime) {
+        // 再生時刻を増やす
+        currentPlaybackTime += ptsTime - currentPlaybackPtsTime;
+        currentPlaybackPtsTime = ptsTime;
+      }
+
+      // 表示されてなさそうなときは間引く
+      if (rafPauseCount <= 1 || rafPauseCount % 10 == 2) {
+        drawWebGpu(currentFrame);
+      }
 
       av_frame_free(&currentFrame);
     }
   }
 
-  if (!captionCallback.isNull() && audioFrame) {
+  if (!captionCallback.isNull() && estimatedAudioPlayTime != -1) {
     while (captionDataQueue.size() > 0) {
       std::pair<int64_t, std::vector<uint8_t>> p;
       {
@@ -939,17 +990,6 @@ void decoderMainloop() {
       double pts = (double)p.first;
       std::vector<uint8_t> &buffer = p.second;
       double ptsTime = pts * av_q2d(captionStream->time_base);
-
-      // AudioFrameは完全に見るだけ
-      // VideoとAudioのPTSをクロックから時間に直す
-      // TODO: クロック一回転したときの処理
-      double audioPtsTime = audioFrame->pts * av_q2d(audioFrame->time_base);
-
-      // 上記から推定される、現在再生している音声のPTS（時間）
-      // double estimatedAudioPlayTime =
-      //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
-      double estimatedAudioPlayTime =
-          audioPtsTime - (double)bufferedAudioSamples * audioTempo / 48000;
 
       auto data = emscripten::val(
           emscripten::typed_memory_view<uint8_t>(buffer.size(), &buffer[0]));
