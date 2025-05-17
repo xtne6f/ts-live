@@ -18,7 +18,7 @@ void startAudioWorklet();
 void feedAudioData(float *buffer0, float *buffer1, int samples) {
   if (!startedAudioWorklet &&
       // clang-format off
-      EM_ASM_INT({return Module && Module.myAudio && Module.myAudio.discardIntervalId ? 0 : 1;})
+      EM_ASM_INT({return Module.myAudio && Module.myAudio.discard ? 0 : 1;})
       // clang-format on
   ) {
     startAudioWorklet();
@@ -26,7 +26,7 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
 
   // clang-format off
   EM_ASM({
-    if (Module && Module.myAudio && Module.myAudio.discardIntervalId) {
+    if (Module.myAudio && Module.myAudio.discard) {
       const buffer0 = HEAPF32.slice($0>>2, ($0>>2) + $2);
       const buffer1 = HEAPF32.slice($1>>2, ($1>>2) + $2);
       Module.myAudio.discardSamples.push({
@@ -72,9 +72,8 @@ void startAudioWorklet() {
       gainNode.connect(audioContext.destination);
       console.log('AudioSetup OK');
       let samples = [];
-      if (Module.myAudio && Module.myAudio.discardIntervalId) {
+      if (Module.myAudio && Module.myAudio.discard) {
         samples = Module.myAudio.discardSamples;
-        clearInterval(Module.myAudio.discardIntervalId);
       }
       Module['myAudio'] = {ctx: audioContext, node: audioNode, gain: gainNode};
       audioContext.resume();
@@ -99,6 +98,16 @@ void startAudioWorklet() {
   // clang-format on
 }
 
+void discardMutedAudioSamples() {
+  // clang-format off
+  EM_ASM({
+    if (Module.myAudio && Module.myAudio.discard) {
+      Module.myAudio.discard();
+    }
+  });
+  // clang-format on
+}
+
 void setAudioGain(double val) {
   if (val != 0.0) {
     startAudioWorklet();
@@ -108,12 +117,13 @@ void setAudioGain(double val) {
   EM_ASM(
       {
         if ($0 == 0.0 && !Module.myAudio) {
-          let discardBaseTime = performance.now();
+          let discardBaseTime = 0;
           Module.myAudio = {discardSamples: []};
-          Module.myAudio.discardIntervalId = setInterval(() => {
+          Module.myAudio.discard = () => {
             // AudioWorklet起動前の入力を等速で捨てるため
             const samples = Module.myAudio.discardSamples;
             while (samples.length > 0) {
+              if (!discardBaseTime) discardBaseTime = performance.now();
               const duration = samples[0].buffer0.length / (48000 / 1000);
               if (discardBaseTime + duration > performance.now()) break;
               discardBaseTime += duration;
@@ -124,7 +134,7 @@ void setAudioGain(double val) {
               sum += samples[i].buffer0.length;
             }
             Module.setBufferedAudioSamples(sum);
-          }, 30);
+          };
         }
         if (Module.myAudio && Module.myAudio.gain)
           Module.myAudio.gain.gain.setValueAtTime($0,

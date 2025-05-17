@@ -811,6 +811,8 @@ void decoderMainloop() {
                 videoFrameQueue.size(), audioFrameQueue.size(),
                 videoPacketQueue.size(), audioPacketQueue.size());
 
+  discardMutedAudioSamples();
+
   if (videoStream && !audioStreamList.empty() && !statsCallback.isNull()) {
     auto data = emscripten::val::object();
     data.set("time", currentPlaybackTime / 1000.0);
