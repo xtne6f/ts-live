@@ -114,9 +114,9 @@ double currentAudioTempo = 1.0;
 
 void setPlaybackRate(double rate) {
   //
-  if (!(rate >= 0.5 && rate <= 100.0)) {
-    // atempoフィルタの範囲外
-    spdlog::error("setPlaybackRate() out of range [0.5 - 100]");
+  if (!(rate >= 0.1 && rate <= 100.0)) {
+    // atempoフィルタの対応範囲は[0.5-100]だが、[0.1-0.5)の区間も無音で対応する
+    spdlog::error("setPlaybackRate() out of range [0.1 - 100]");
     return;
   }
   std::lock_guard<std::mutex> lock(audioPacketMtx);
@@ -564,14 +564,17 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
         if (reallocGraph) {
           reallocGraph = false;
           avfilter_graph_free(&filterGraph);
-          if (currentAudioTempo != 1.0) {
+          // atempoフィルタの対応範囲になるように必要なら除数に分ける
+          int tempoDiv =
+              currentAudioTempo < 0.5 ? (int)(1 / currentAudioTempo) : 1;
+          if (currentAudioTempo * tempoDiv != 1.0) {
             filterGraph = allocAudioFilterGraph(
-                currentAudioTempo, currentSampleRate,
+                currentAudioTempo * tempoDiv, currentSampleRate,
                 (AVSampleFormat)currentFormat, currentChLayout, abufferContext,
                 abuffersinkContext);
             if (!filterGraph) {
               spdlog::error("allocAudioFilterGraph({}) failed",
-                            currentAudioTempo);
+                            currentAudioTempo * tempoDiv);
             }
           }
           if (!filterGraph &&
@@ -894,6 +897,7 @@ void decoderMainloop(bool calledByRaf) {
   }
 
   AVFrame *currentFrame = nullptr;
+  int audioTempoDiv;
   {
     // estimatedAudioPlayTimeを計算するため
     double audioPtsTime = -1;
@@ -908,6 +912,8 @@ void decoderMainloop(bool calledByRaf) {
       }
       audioTempo = currentAudioTempo;
     }
+    // ここはatempoフィルタに適用する計算式と一致させること
+    audioTempoDiv = audioTempo < 0.5 ? (int)(1 / audioTempo) : 1;
 
     std::lock_guard<std::mutex> lock(videoPacketMtx);
     if (audioPtsTime != -1) {
@@ -1011,9 +1017,20 @@ void decoderMainloop(bool calledByRaf) {
 
     if (frame->sample_rate == 48000 && frame->format == AV_SAMPLE_FMT_FLTP &&
         frame->ch_layout.nb_channels == 2) {
-      feedAudioData(reinterpret_cast<float *>(frame->data[0]),
-                    reinterpret_cast<float *>(frame->data[1]),
-                    frame->nb_samples);
+      if (audioTempoDiv > 1) {
+        // 無音にして除数分だけ引き伸ばす
+        float *zeroData = reinterpret_cast<float *>(frame->data[0]);
+        for (int i = 0; i < frame->nb_samples; i++) {
+          zeroData[i] = 0;
+        }
+        for (int i = 0; i < audioTempoDiv; i++) {
+          feedAudioData(zeroData, zeroData, frame->nb_samples);
+        }
+      } else {
+        feedAudioData(reinterpret_cast<float *>(frame->data[0]),
+                      reinterpret_cast<float *>(frame->data[1]),
+                      frame->nb_samples);
+      }
     }
 
     av_frame_free(&frame);
