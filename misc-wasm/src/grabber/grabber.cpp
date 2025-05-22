@@ -130,8 +130,8 @@ emscripten::val grabFirstFrame(size_t size) {
       auto it = outputBuffer.begin();
       for (int i = 0, h2 = frame->height / 2; i < h2; ++i) {
         uint8_t *ly = frame->buf[0]->data + frame->linesize[0] * i * 2;
-        uint8_t *lu = frame->buf[1]->data + frame->linesize[1] * i;
-        uint8_t *lv = frame->buf[2]->data + frame->linesize[2] * i;
+        uint8_t *lu = frame->buf[1]->data + frame->linesize[1] * (i / 2 * 2);
+        uint8_t *lv = frame->buf[2]->data + frame->linesize[2] * (i / 2 * 2);
         for (int j = 0, w2 = frame->width / 2; j < w2; ++j) {
           // YUV -> RGBA
           int y = ((ly[0] + ly[1]) >> 1) - 16;
