@@ -900,6 +900,8 @@ void decoderMainloop(bool calledByRaf) {
   int audioTempoDiv;
   {
     // estimatedAudioPlayTimeを計算するため
+    static std::chrono::steady_clock::time_point lastTime;
+    auto nowTime = std::chrono::steady_clock::now();
     double audioPtsTime = -1;
     double audioTempo;
     {
@@ -917,17 +919,30 @@ void decoderMainloop(bool calledByRaf) {
 
     std::lock_guard<std::mutex> lock(videoPacketMtx);
     if (audioPtsTime != -1) {
-      // 上記から推定される、現在再生している音声のPTS（時間）
-      // estimatedAudioPlayTime =
-      //     audioPtsTime - (double)queuedSize / ctx.openedAudioSpec.freq;
-      estimatedAudioPlayTime =
+      // 経過時間から予測した今回のestimatedAudioPlayTime
+      double predictedTime =
+          estimatedAudioPlayTime +
+          std::chrono::duration<double>(nowTime - lastTime).count() *
+              audioTempo;
+      // 音声のPTSとバッファ量から計算した今回のestimatedAudioPlayTime
+      double measuredTime =
           audioPtsTime - (double)bufferedAudioSamples * audioTempo / 48000;
+      // 上記から推定される、現在再生している音声のPTS（時間）
+      // 基本的にはmeasuredTimeに従うがbufferedAudioSamplesの更新間隔の都合など
+      // でゆらぐので、予測とのずれが小さいときはpredictedTimeも参照する
+      if (predictedTime > measuredTime - 0.5 &&
+          predictedTime < measuredTime + 0.5) {
+        estimatedAudioPlayTime = predictedTime * 0.9 + measuredTime * 0.1;
+      } else {
+        estimatedAudioPlayTime = measuredTime;
+      }
     } else {
       estimatedAudioPlayTime = -1;
     }
     if (!videoFrameQueue.empty()) {
       currentFrame = videoFrameQueue.front();
     }
+    lastTime = nowTime;
   }
 
   if (currentFrame && estimatedAudioPlayTime != -1) {
