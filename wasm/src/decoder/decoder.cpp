@@ -978,7 +978,7 @@ void decoderMainloop(bool calledByRaf) {
 
       // 表示されてなさそうなときは間引く
       if (rafPauseCount <= 1 || rafPauseCount % 10 == 2) {
-        drawWebGpu(currentFrame);
+        drawWebGpu(currentFrame, true);
       }
 
       av_frame_free(&currentFrame);

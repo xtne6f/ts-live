@@ -340,33 +340,11 @@ void initWebGpu() {
 static void (
     *initDeviceCallback)(); // キャプチャするとコンパイルできなかったのでグローバル変数化・・・
 
-void drawWebGpu(AVFrame *frame) {
+void drawWebGpu(AVFrame *frame, bool renderFlag) {
   if (frame->width != ctx.textureWidth || frame->height != ctx.textureHeight) {
     releaseTextures();
     createTextures(frame->width, frame->height);
   }
-
-  WGPUTextureView backBufView =
-      wgpuSwapChainGetCurrentTextureView(ctx.swapChain); // create textureView
-
-  WGPURenderPassColorAttachment colorDesc = {};
-  colorDesc.view = backBufView;
-  colorDesc.loadOp = WGPULoadOp_Clear;
-  colorDesc.storeOp = WGPUStoreOp_Store;
-  colorDesc.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-  colorDesc.clearValue.r = 0.0f;
-  colorDesc.clearValue.g = 0.0f;
-  colorDesc.clearValue.b = 0.0f;
-  colorDesc.clearValue.a = 1.0f;
-
-  WGPUComputePassDescriptor compPassDesc = {};
-
-  WGPURenderPassDescriptor renderPassDesc = {};
-  renderPassDesc.colorAttachmentCount = 1;
-  renderPassDesc.colorAttachments = &colorDesc;
-
-  WGPUCommandEncoder encoder =
-      wgpuDeviceCreateCommandEncoder(ctx.device, nullptr); // create encoder
 
   WGPUExtent3D copySize = {
       .width = static_cast<uint32_t>(frame->width),
@@ -416,6 +394,32 @@ void drawWebGpu(AVFrame *frame) {
   wgpuQueueWriteTexture(ctx.queue, &copyTexture, frame->data[2],
                         frame->height * frame->linesize[2],
                         &textureDataLayoutUv, &copySizeuv);
+
+  if (!renderFlag) {
+    return;
+  }
+
+  WGPUTextureView backBufView =
+      wgpuSwapChainGetCurrentTextureView(ctx.swapChain); // create textureView
+
+  WGPURenderPassColorAttachment colorDesc = {};
+  colorDesc.view = backBufView;
+  colorDesc.loadOp = WGPULoadOp_Clear;
+  colorDesc.storeOp = WGPUStoreOp_Store;
+  colorDesc.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+  colorDesc.clearValue.r = 0.0f;
+  colorDesc.clearValue.g = 0.0f;
+  colorDesc.clearValue.b = 0.0f;
+  colorDesc.clearValue.a = 1.0f;
+
+  WGPUComputePassDescriptor compPassDesc = {};
+
+  WGPURenderPassDescriptor renderPassDesc = {};
+  renderPassDesc.colorAttachmentCount = 1;
+  renderPassDesc.colorAttachments = &colorDesc;
+
+  WGPUCommandEncoder encoder =
+      wgpuDeviceCreateCommandEncoder(ctx.device, nullptr); // create encoder
 
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);
