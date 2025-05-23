@@ -421,6 +421,15 @@ void drawWebGpu(AVFrame *frame, bool renderFlag) {
   WGPUCommandEncoder encoder =
       wgpuDeviceCreateCommandEncoder(ctx.device, nullptr); // create encoder
 
+  WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(
+      encoder, &renderPassDesc); // create pass
+  wgpuRenderPassEncoderSetPipeline(pass, ctx.pipeline);
+  wgpuRenderPassEncoderSetBindGroup(pass, 0, ctx.bindGroup, 0, 0);
+  wgpuRenderPassEncoderDraw(pass, 6, 1, 0, 0);
+
+  wgpuRenderPassEncoderEnd(pass);
+  wgpuRenderPassEncoderRelease(pass); // release pass
+
   WGPUComputePassEncoder compPass =
       wgpuCommandEncoderBeginComputePass(encoder, &compPassDesc);
   wgpuComputePassEncoderSetPipeline(compPass, ctx.yadifPipeline);
@@ -430,15 +439,6 @@ void drawWebGpu(AVFrame *frame, bool renderFlag) {
                                            ctx.textureHeight / 4 / 2, 1);
   wgpuComputePassEncoderEnd(compPass);
   wgpuComputePassEncoderRelease(compPass);
-
-  WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(
-      encoder, &renderPassDesc); // create pass
-  wgpuRenderPassEncoderSetPipeline(pass, ctx.pipeline);
-  wgpuRenderPassEncoderSetBindGroup(pass, 0, ctx.bindGroup, 0, 0);
-  wgpuRenderPassEncoderDraw(pass, 6, 1, 0, 0);
-
-  wgpuRenderPassEncoderEnd(pass);
-  wgpuRenderPassEncoderRelease(pass); // release pass
 
   WGPUCommandBuffer commands =
       wgpuCommandEncoderFinish(encoder, nullptr); // create commands
