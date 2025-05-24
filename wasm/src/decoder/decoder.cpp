@@ -57,10 +57,6 @@ std::condition_variable waitCv;
 size_t inputBufferReadIndex = 0;
 size_t inputBufferWriteIndex = 0;
 
-// for libav
-AVCodecContext *videoCodecContext = nullptr;
-AVCodecContext *audioCodecContext = nullptr;
-
 std::deque<AVFrame *> videoFrameQueue, audioFrameQueue;
 std::deque<std::pair<int64_t, std::vector<uint8_t>>> captionDataQueue;
 std::mutex captionDataMtx;
@@ -101,12 +97,25 @@ void setStatsCallback(emscripten::val callback) {
   statsCallback = callback;
 }
 
-enum DualMonoMode { MAIN = 0, SUB = 1 };
+enum class DualMonoMode { MAIN = 0, SUB = 1 };
 DualMonoMode dualMonoMode = DualMonoMode::MAIN;
 
 void setDualMonoMode(int mode) {
   //
   dualMonoMode = (DualMonoMode)mode;
+}
+
+enum class DetelecineMode { NEVER = 0, FORCE = 1, AUTO = 2 };
+DetelecineMode detelecineMode = DetelecineMode::NEVER;
+
+void setDetelecineMode(int mode) {
+  //
+  if (mode < 0 || mode > 2) {
+    spdlog::error("setDetelecineMode() unsupported mode");
+    return;
+  }
+  std::lock_guard<std::mutex> lock(videoPacketMtx);
+  detelecineMode = (DetelecineMode)mode;
 }
 
 double targetAudioTempo = 1.0;
@@ -266,6 +275,72 @@ void reset() {
   resetInternal();
 }
 
+void detectTelecine(AVFrame *frame, AVFrame *&prevFrame,
+                    double (&telecineDetectCounts)[5], int &frameCount) {
+  if (prevFrame && frame->width == prevFrame->width &&
+      frame->height == prevFrame->height) {
+    // 上下フィールドについて前後フレームの差分絶対値和を計算する
+    int64_t topDiff = 0;
+    int64_t bottomDiff = 0;
+    for (int i = 0; i < 3; i++) {
+      // テレシネ周期の推測が目的なので支障ない程度にサボる
+      int odd = frameCount % 2;
+      int w = frame->width / (i ? 2 : 1);
+      int h = frame->height / (i ? 2 : 1) / (2 - odd);
+      for (int y = h / 2 * odd; y < h; y++) {
+        const uint8_t *prev = prevFrame->data[i] + y * prevFrame->linesize[i];
+        const uint8_t *cur = frame->data[i] + y * frame->linesize[i];
+        int sad = 0;
+        for (int x = 0; x < w; x++) {
+          int d = cur[x] - prev[x];
+          sad += FFABS(d);
+        }
+        (y % 2 ? bottomDiff : topDiff) += sad;
+      }
+    }
+
+    // 前後フレームが最も変化すると概ね1になるような値
+    double reliability = FFMAX(topDiff, bottomDiff) /
+                         (0.5 * 0.5 * 1.5 * 255 * frame->width * frame->height);
+    // じゅうぶん変化していると判断するしきい値を定めてこれを信頼度とする
+    reliability = FFMIN(reliability, 0.01) * 100;
+    if (bottomDiff > 3 * topDiff) {
+      // repeated-top
+      telecineDetectCounts[frameCount % 5] += reliability;
+    } else if (topDiff > 3 * bottomDiff) {
+      // repeated-bottom
+      telecineDetectCounts[(frameCount + 3) % 5] += reliability;
+    }
+    for (int i = 0; i < 5; i++) {
+      // 信頼度に応じて半減期を∞～30フレームとする。2^(-1/30)≒0.977
+      telecineDetectCounts[i] *= 1 - (1 - 0.977) * reliability;
+    }
+
+    // テレシネの周期を記録する
+    int cycleAdjust = 0;
+    for (int i = 0; i < 5; i++) {
+      if (telecineDetectCounts[i] > telecineDetectCounts[cycleAdjust]) {
+        cycleAdjust = i;
+      }
+    }
+    av_dict_set_int(&frame->metadata, "ts-live.frame_cycle",
+                    (frameCount + 5 - cycleAdjust) % 5, 0);
+
+    // テレシネっぽいかどうか記録する
+    // 安定のために前回の判定によってしきい値を変える
+    if (telecineDetectCounts[cycleAdjust] >
+        (av_dict_get(prevFrame->metadata, "ts-live.is_telecine", nullptr, 0)
+             ? 1
+             : 4)) {
+      av_dict_set(&frame->metadata, "ts-live.is_telecine", "1", 0);
+    }
+    frameCount = (frameCount + 1) % 10;
+  }
+
+  av_frame_free(&prevFrame);
+  prevFrame = av_frame_clone(frame);
+}
+
 void videoDecoderThreadFunc(bool &terminateFlag) {
   // find decoder
   const AVCodec *videoCodec =
@@ -278,7 +353,7 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
   }
 
   // Codec Context
-  videoCodecContext = avcodec_alloc_context3(videoCodec);
+  AVCodecContext *videoCodecContext = avcodec_alloc_context3(videoCodec);
   if (videoCodecContext == nullptr) {
     spdlog::error("avcodec_alloc_context3 for video failed");
     return;
@@ -298,10 +373,20 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
   spdlog::debug("avcodec for video open success.");
 
   AVFrame *frame = av_frame_alloc();
+  AVFrame *prevFrame = nullptr;
   double ptsTimeForContinuityCheck = -1;
+
+  // telecine検出用
+  // 5フレーム周期のどこにrepeated-topがあるか
+  // idetと同じく半減期を使う
+  double telecineDetectCounts[5] = {};
+
+  // 👆を参照するためのカウンタ
+  int frameCount = 0;
 
   while (!terminateFlag) {
     AVPacket *ppacket;
+    bool detectTelecineFlag;
     {
       std::unique_lock<std::mutex> lock(videoPacketMtx);
       // メインループの処理の頻度が下がったときにパケットが蓄積しないようにする
@@ -340,6 +425,7 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
       }
       ppacket = videoPacketQueue.front();
       videoPacketQueue.pop_front();
+      detectTelecineFlag = detelecineMode != DetelecineMode::NEVER;
     }
     AVPacket &packet = *ppacket;
 
@@ -383,7 +469,9 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
       frame->time_base.num = videoStream->time_base.num;
 
       // time_base が 0/0 な不正フレームは捨てる
-      if (frame->time_base.den != 0 && frame->time_base.num != 0) {
+      // yuv420p以外はたぶん来ないが一応確認する
+      if (frame->time_base.den != 0 && frame->time_base.num != 0 &&
+          frame->format == AV_PIX_FMT_YUV420P) {
         AVFrame *cloneFrame = av_frame_clone(frame);
         double ptsTime = frame->pts * av_q2d(frame->time_base);
         if (ptsTimeForContinuityCheck == -1 ||
@@ -393,6 +481,12 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
           av_dict_set(&cloneFrame->metadata, "ts-live.discontinuity", "1", 0);
         }
         ptsTimeForContinuityCheck = ptsTime;
+        if (detectTelecineFlag) {
+          detectTelecine(cloneFrame, prevFrame, telecineDetectCounts,
+                         frameCount);
+        } else {
+          av_frame_free(&prevFrame);
+        }
         std::lock_guard<std::mutex> lock(videoPacketMtx);
         videoFrameFound = true;
 
@@ -401,6 +495,8 @@ void videoDecoderThreadFunc(bool &terminateFlag) {
     }
     av_packet_free(&ppacket);
   }
+  av_frame_free(&prevFrame);
+  av_frame_free(&frame);
 
   spdlog::debug("freeing videoCodecContext");
   avcodec_free_context(&videoCodecContext);
@@ -473,7 +569,7 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
   } else {
     spdlog::debug("Audio Decoder created.");
   }
-  audioCodecContext = avcodec_alloc_context3(audioCodec);
+  AVCodecContext *audioCodecContext = avcodec_alloc_context3(audioCodec);
   if (audioCodecContext == nullptr) {
     spdlog::error("avcodec_alloc_context3 for audio failed");
     return;
@@ -635,6 +731,7 @@ void audioDecoderThreadFunc(bool &terminateFlag) {
     av_packet_free(&ppacket);
   }
   av_frame_free(&filtFrame);
+  av_frame_free(&frame);
   avfilter_graph_free(&filterGraph);
   av_channel_layout_uninit(&currentChLayout);
   spdlog::debug("freeing videoCodecContext");
@@ -810,6 +907,7 @@ void decoderThreadFunc() {
     }
     av_packet_free(&ppacket);
   }
+  av_frame_free(&frame);
 
   spdlog::debug("decoderThreadFunc breaked.");
 
@@ -863,6 +961,7 @@ void decoderMainloop(bool calledByRaf) {
 
   discardMutedAudioSamples();
 
+  static bool telecineFlag = false;
   if (videoStream && !audioStreamList.empty() && !statsCallback.isNull()) {
     auto data = emscripten::val::object();
     data.set("time", currentPlaybackTime / 1000.0);
@@ -873,6 +972,9 @@ void decoderMainloop(bool calledByRaf) {
              (inputBufferWriteIndex - inputBufferReadIndex) / 1000000.0);
     data.set("CaptionDataQueueSize",
              captionStream ? captionDataQueue.size() : 0);
+    if (detelecineMode != DetelecineMode::NEVER) {
+      data.set("TelecineFlag", telecineFlag);
+    }
     statsBuffer.push_back(std::move(data));
     if (!calledByRaf) {
       auto statsArray = emscripten::val::array();
@@ -968,7 +1070,8 @@ void decoderMainloop(bool calledByRaf) {
     double videoPtsTime = currentFrame->pts * av_q2d(currentFrame->time_base);
 
     // 1フレーム分くらいはズレてもいいからこれでいいか。フレーム真面目に考えると良くわからない。
-    bool showFlag = estimatedAudioPlayTime > videoPtsTime;
+    static double videoPtsAdjustment = 0;
+    bool showFlag = estimatedAudioPlayTime > videoPtsTime + videoPtsAdjustment;
 
     // リップシンク条件を満たしてたらVideoFrame再生
     if (showFlag) {
@@ -979,6 +1082,7 @@ void decoderMainloop(bool calledByRaf) {
         videoPacketCv.notify_all();
       }
 
+      int64_t ptsDiff = 0;
       int64_t ptsTime = (int64_t)(videoPtsTime * 1000);
       if (currentPlaybackPtsTime == -1 ||
           !!av_dict_get(currentFrame->metadata, "ts-live.discontinuity",
@@ -987,13 +1091,40 @@ void decoderMainloop(bool calledByRaf) {
         currentPlaybackPtsTime = ptsTime;
       } else if (currentPlaybackPtsTime < ptsTime) {
         // 再生時刻を増やす
-        currentPlaybackTime += ptsTime - currentPlaybackPtsTime;
+        ptsDiff = ptsTime - currentPlaybackPtsTime;
+        currentPlaybackTime += ptsDiff;
         currentPlaybackPtsTime = ptsTime;
       }
 
       // 表示されてなさそうなときは間引く
       if (rafPauseCount <= 1 || rafPauseCount % 10 == 2) {
-        drawWebGpu(currentFrame, true);
+        // このフレームの本来の表示期間を推測する。外れ値は補正する
+        double frameDuration = (ptsDiff > 200 ? 200 : ptsDiff) / 1000.0;
+
+        telecineFlag = detelecineMode != DetelecineMode::NEVER;
+        if (telecineFlag) {
+          telecineFlag = false;
+          auto entry = av_dict_get(currentFrame->metadata,
+                                   "ts-live.frame_cycle", nullptr, 0);
+          if (entry) {
+            telecineFlag = detelecineMode == DetelecineMode::FORCE ||
+                           av_dict_get(currentFrame->metadata,
+                                       "ts-live.is_telecine", nullptr, 0);
+            if (telecineFlag) {
+              // フレームレートを4/5に下げて5枚ごとに1枚だけスキップする
+              long adjusted = strtol(entry->value, nullptr, 10);
+              // drawWebGpu()は少なくとも1フレーム遅れるので打ち消す
+              videoPtsAdjustment =
+                  frameDuration * ((adjusted == 0 ? 5 : adjusted * 2) - 8) / 8;
+              drawWebGpu(currentFrame, adjusted != 1);
+            }
+          }
+        }
+        if (!telecineFlag) {
+          // drawWebGpu()は少なくとも1フレーム遅れるので打ち消す
+          videoPtsAdjustment = -frameDuration;
+          drawWebGpu(currentFrame, true);
+        }
       }
 
       av_frame_free(&currentFrame);
