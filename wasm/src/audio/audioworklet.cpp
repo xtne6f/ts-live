@@ -6,14 +6,14 @@
 #include "../util/util.hpp"
 
 int bufferedAudioSamples = 0;
-bool startedAudioWorklet = false;
+static bool startedAudioWorklet = false;
 
 void setBufferedAudioSamples(int samples) {
   // set buffereredAudioSamples
   bufferedAudioSamples = samples;
 }
 
-void startAudioWorklet();
+static void startAudioWorklet(double gainValue);
 
 void feedAudioData(float *buffer0, float *buffer1, int samples) {
   if (!startedAudioWorklet &&
@@ -21,7 +21,7 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
       EM_ASM_INT({return Module.myAudio && Module.myAudio.discard ? 0 : 1;})
       // clang-format on
   ) {
-    startAudioWorklet();
+    startAudioWorklet(1.0);
   }
 
   // clang-format off
@@ -51,7 +51,7 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
   // clang-format on
 }
 
-void startAudioWorklet() {
+static void startAudioWorklet(double gainValue) {
   if (startedAudioWorklet) {
     return;
   }
@@ -79,10 +79,7 @@ void startAudioWorklet() {
       audioContext.resume();
       audioNode.port.onmessage = e => {Module.setBufferedAudioSamples(e.data)};
       console.log('latency', Module['myAudio']['ctx'].baseLatency);
-      if (Module.myAudio.gainValue === undefined) {
-        Module.myAudio.gainValue = 1.0;
-      }
-      Module.myAudio.gain.gain.setValueAtTime(Module.myAudio.gainValue,
+      Module.myAudio.gain.gain.setValueAtTime($1,
                                                 Module.myAudio.ctx.currentTime);
       // まだ捨てていないAudioWorklet起動前の入力を拾う
       while (samples.length > 0) {
@@ -94,7 +91,7 @@ void startAudioWorklet() {
         samples.shift();
       }
     })();
-  }, scriptSource.c_str());
+  }, scriptSource.c_str(), gainValue);
   // clang-format on
 }
 
@@ -110,7 +107,7 @@ void discardMutedAudioSamples() {
 
 void setAudioGain(double val) {
   if (val != 0.0) {
-    startAudioWorklet();
+    startAudioWorklet(val);
   }
 
   // clang-format off

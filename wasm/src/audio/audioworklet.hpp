@@ -1,7 +1,6 @@
 #pragma once
 
 void feedAudioData(float *buffer0, float *buffer1, int samples);
-void startAudioWorklet();
 void discardMutedAudioSamples();
 void setBufferedAudioSamples(int samples);
 void setAudioGain(double val);
