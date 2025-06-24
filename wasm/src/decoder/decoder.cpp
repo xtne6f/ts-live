@@ -262,6 +262,7 @@ void resetInternal() {
       av_frame_free(&frame);
     }
   }
+  clearAudioSamples();
   videoStream = nullptr;
   audioStreamList.clear();
   captionStream = nullptr;

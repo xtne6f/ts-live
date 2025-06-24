@@ -13,6 +13,13 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
         this.buffers1.push(e.data.buffer1)
         this.bufferedSamples += e.data.buffer0.length
         this.port.postMessage(this.bufferedSamples)
+      } else if (e.data.type === 'reset') {
+        this.started = false
+        this.currentBufferReadSize = 0
+        this.buffers0.length = 0
+        this.buffers1.length = 0
+        this.bufferedSamples = 0
+        this.port.postMessage(0)
       }
     }
   }

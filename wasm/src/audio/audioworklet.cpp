@@ -29,7 +29,7 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
     if (Module.myAudio && Module.myAudio.discard) {
       const buffer0 = HEAPF32.slice($0>>2, ($0>>2) + $2);
       const buffer1 = HEAPF32.slice($1>>2, ($1>>2) + $2);
-      Module.myAudio.discardSamples.push({
+      Module.myAudio.discard.samples.push({
         buffer0: buffer0,
         buffer1: buffer1
       });
@@ -48,6 +48,21 @@ void feedAudioData(float *buffer0, float *buffer1, int samples) {
       }, [buffer0.buffer, buffer1.buffer]);
     }
   }, buffer0, buffer1, samples);
+  // clang-format on
+}
+
+void clearAudioSamples() {
+  // clang-format off
+  EM_ASM({
+    if (Module.myAudio && Module.myAudio.discard) {
+      Module.myAudio.discard = {samples: []};
+      Module.setBufferedAudioSamples(0);
+      return;
+    }
+    if (Module.myAudio && Module.myAudio.node) {
+      Module.myAudio.node.port.postMessage({type: 'reset'});
+    }
+  });
   // clang-format on
 }
 
@@ -73,7 +88,7 @@ static void startAudioWorklet(double gainValue) {
       console.log('AudioSetup OK');
       let samples = [];
       if (Module.myAudio && Module.myAudio.discard) {
-        samples = Module.myAudio.discardSamples;
+        samples = Module.myAudio.discard.samples;
       }
       Module['myAudio'] = {ctx: audioContext, node: audioNode, gain: gainNode};
       audioContext.resume();
@@ -99,7 +114,20 @@ void discardMutedAudioSamples() {
   // clang-format off
   EM_ASM({
     if (Module.myAudio && Module.myAudio.discard) {
-      Module.myAudio.discard();
+      // AudioWorklet起動前の入力を等速で捨てるため
+      const discard = Module.myAudio.discard;
+      while (discard.samples.length > 0) {
+        if (!discard.baseTime) discard.baseTime = performance.now();
+        const duration = discard.samples[0].buffer0.length / (48000 / 1000);
+        if (discard.baseTime + duration > performance.now()) break;
+        discard.baseTime += duration;
+        discard.samples.shift();
+      }
+      let sum = 0;
+      for (let i = 0; i < discard.samples.length; i++) {
+        sum += discard.samples[i].buffer0.length;
+      }
+      Module.setBufferedAudioSamples(sum);
     }
   });
   // clang-format on
@@ -114,24 +142,7 @@ void setAudioGain(double val) {
   EM_ASM(
       {
         if ($0 == 0.0 && !Module.myAudio) {
-          let discardBaseTime = 0;
-          Module.myAudio = {discardSamples: []};
-          Module.myAudio.discard = () => {
-            // AudioWorklet起動前の入力を等速で捨てるため
-            const samples = Module.myAudio.discardSamples;
-            while (samples.length > 0) {
-              if (!discardBaseTime) discardBaseTime = performance.now();
-              const duration = samples[0].buffer0.length / (48000 / 1000);
-              if (discardBaseTime + duration > performance.now()) break;
-              discardBaseTime += duration;
-              samples.shift();
-            }
-            let sum = 0;
-            for (let i = 0; i < samples.length; i++) {
-              sum += samples[i].buffer0.length;
-            }
-            Module.setBufferedAudioSamples(sum);
-          };
+          Module.myAudio = {discard: {samples: []}};
         }
         if (Module.myAudio && Module.myAudio.gain)
           Module.myAudio.gain.gain.setValueAtTime($0,
