@@ -6,7 +6,8 @@
 #include "../util/util.hpp"
 
 int bufferedAudioSamples = 0;
-static bool startedAudioWorklet = false;
+static bool audioWorkletStarted = false;
+static bool audioWorkletPaused = false;
 
 void setBufferedAudioSamples(int samples) {
   // set buffereredAudioSamples
@@ -16,7 +17,7 @@ void setBufferedAudioSamples(int samples) {
 static void startAudioWorklet(double gainValue);
 
 void feedAudioData(float *buffer0, float *buffer1, int samples) {
-  if (!startedAudioWorklet &&
+  if (!audioWorkletStarted &&
       // clang-format off
       EM_ASM_INT({return Module.myAudio && Module.myAudio.discard ? 0 : 1;})
       // clang-format on
@@ -66,11 +67,33 @@ void clearAudioSamples() {
   // clang-format on
 }
 
+void pauseAudioWorklet() {
+  audioWorkletPaused = true;
+  // clang-format off
+  EM_ASM({
+    if (Module.myAudio && Module.myAudio.node) {
+      Module.myAudio.node.port.postMessage({type: 'pause'});
+    }
+  });
+  // clang-format on
+}
+
+void resumeAudioWorklet() {
+  audioWorkletPaused = false;
+  // clang-format off
+  EM_ASM({
+    if (Module.myAudio && Module.myAudio.node) {
+      Module.myAudio.node.port.postMessage({type: 'resume'});
+    }
+  });
+  // clang-format on
+}
+
 static void startAudioWorklet(double gainValue) {
-  if (startedAudioWorklet) {
+  if (audioWorkletStarted) {
     return;
   }
-  startedAudioWorklet = true;
+  audioWorkletStarted = true;
 
   std::string scriptSource = slurp("/processor.js");
 
@@ -96,6 +119,9 @@ static void startAudioWorklet(double gainValue) {
       console.log('latency', Module['myAudio']['ctx'].baseLatency);
       Module.myAudio.gain.gain.setValueAtTime($1,
                                                 Module.myAudio.ctx.currentTime);
+      if ($2) {
+        audioNode.port.postMessage({type: 'pause'});
+      }
       // まだ捨てていないAudioWorklet起動前の入力を拾う
       while (samples.length > 0) {
         audioNode.port.postMessage({
@@ -106,7 +132,7 @@ static void startAudioWorklet(double gainValue) {
         samples.shift();
       }
     })();
-  }, scriptSource.c_str(), gainValue);
+  }, scriptSource.c_str(), gainValue, audioWorkletPaused);
   // clang-format on
 }
 
@@ -116,6 +142,9 @@ void discardMutedAudioSamples() {
     if (Module.myAudio && Module.myAudio.discard) {
       // AudioWorklet起動前の入力を等速で捨てるため
       const discard = Module.myAudio.discard;
+      if ($0) {
+        discard.baseTime = 0;
+      }
       while (discard.samples.length > 0) {
         if (!discard.baseTime) discard.baseTime = performance.now();
         const duration = discard.samples[0].buffer0.length / (48000 / 1000);
@@ -129,7 +158,7 @@ void discardMutedAudioSamples() {
       }
       Module.setBufferedAudioSamples(sum);
     }
-  });
+  }, audioWorkletPaused);
   // clang-format on
 }
 

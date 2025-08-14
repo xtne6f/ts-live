@@ -5,6 +5,7 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
   buffers0 = new Array(0)
   buffers1 = new Array(0)
   started = false
+  paused = false
   constructor (...args) {
     super(...args)
     this.port.onmessage = e => {
@@ -20,6 +21,10 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
         this.buffers1.length = 0
         this.bufferedSamples = 0
         this.port.postMessage(0)
+      } else if (e.data.type === 'pause') {
+        this.paused = true
+      } else if (e.data.type === 'resume') {
+        this.paused = false
       }
     }
   }
@@ -27,6 +32,7 @@ class AudioFeederProcessor extends AudioWorkletProcessor {
     const output = outputs[0]
 
     if (
+      this.paused ||
       this.buffers0.length == 0 ||
       (!this.started && this.bufferedSamples < 48000 / 10)
     ) {

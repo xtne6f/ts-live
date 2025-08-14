@@ -45,6 +45,39 @@ void mainloop(void *arg) {
   decoderMainloop(false);
 }
 
+static long rafID = 0;
+
+static void pauseRafLoop() {
+  if (rafID) {
+    emscripten_cancel_animation_frame(rafID);
+    rafID = 0;
+  }
+}
+
+static void resumeRafLoop() {
+  static bool (*const rafCb)(double, void *) = [](double time, void *userData) {
+    decoderMainloop(true);
+    long &rafID = *static_cast<long *>(userData);
+    rafID = emscripten_request_animation_frame(rafCb, &rafID);
+    return false;
+  };
+  if (!rafID) {
+    rafID = emscripten_request_animation_frame(rafCb, &rafID);
+  }
+}
+
+static void pause() {
+  emscripten_pause_main_loop();
+  pauseRafLoop();
+  pauseAudioWorklet();
+}
+
+static void resume() {
+  resumeAudioWorklet();
+  resumeRafLoop();
+  emscripten_resume_main_loop();
+}
+
 int main() {
   spdlog::info("Wasm main() started.");
 
@@ -57,14 +90,7 @@ int main() {
   initWebGpu();
 
   // requestAnimationFrameも使う。バックグラウンド状態では基本的に一時停止してしまう。
-  static bool (*const rafCb)(double, void *) = [](double time, void *userData) {
-    decoderMainloop(true);
-    long &rafID = *static_cast<long *>(userData);
-    rafID = emscripten_request_animation_frame(rafCb, &rafID);
-    return false;
-  };
-  long rafID = 0;
-  rafID = emscripten_request_animation_frame(rafCb, &rafID);
+  resumeRafLoop();
 
   // //
   // fps指定するとrAFループじゃなくタイマーになるので裏周りしても再生が続く。fps<=0だとrAFが使われるらしい。
@@ -73,7 +99,7 @@ int main() {
   spdlog::info("Starting main loop.");
   emscripten_set_main_loop_arg(mainloop, NULL, fps, simulate_infinite_loop);
 
-  emscripten_cancel_animation_frame(rafID);
+  pauseRafLoop();
   // SDL_DestroyRenderer(ctx.renderer);
   // SDL_DestroyWindow(ctx.window);
   // SDL_Quit();
@@ -92,6 +118,8 @@ EMSCRIPTEN_BINDINGS(ts_live_module) {
   emscripten::function("reset", &reset);
   emscripten::function("setLogLevelDebug", &setLogLevelDebug);
   emscripten::function("setLogLevelInfo", &setLogLevelInfo);
+  emscripten::function("pause", &pause);
+  emscripten::function("resume", &resume);
   emscripten::function("setBufferedAudioSamples", &setBufferedAudioSamples);
   emscripten::function("setAudioGain", &setAudioGain);
   emscripten::function("setDualMonoMode", &setDualMonoMode);
