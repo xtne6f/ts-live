@@ -101,7 +101,8 @@ static void startAudioWorklet(double gainValue) {
   EM_ASM({
     (async function(){
       const audioContext = new AudioContext({sampleRate: 48000});
-      await audioContext.audioWorklet.addModule(`data:text/javascript,${encodeURI(UTF8ToString($0))}`);
+      await audioContext.audioWorklet.addModule(
+          URL.createObjectURL(new Blob([UTF8ToString($0)], {type: 'text/javascript'})));
       const audioNode = new AudioWorkletNode(
           audioContext, 'audio-feeder-processor',
           {numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2]});
