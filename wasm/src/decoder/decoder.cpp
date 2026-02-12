@@ -118,6 +118,25 @@ void setDetelecineMode(int mode) {
   detelecineMode = (DetelecineMode)mode;
 }
 
+enum class DeinterlaceMode { NONE, YADIF, BWDIF };
+DeinterlaceMode deinterlaceMode = DeinterlaceMode::YADIF;
+
+std::string setDeinterlace(std::string filter) {
+  //
+  if (filter == "none") {
+    deinterlaceMode = DeinterlaceMode::NONE;
+  } else if (!filter.compare(0, 5, "yadif") &&
+             (filter.size() == 5 || filter[5] == '=')) {
+    deinterlaceMode = DeinterlaceMode::YADIF;
+  } else if (!filter.compare(0, 5, "bwdif") &&
+             (filter.size() == 5 || filter[5] == '=')) {
+    deinterlaceMode = DeinterlaceMode::BWDIF;
+  }
+  return deinterlaceMode == DeinterlaceMode::YADIF   ? "yadif"
+         : deinterlaceMode == DeinterlaceMode::BWDIF ? "bwdif"
+                                                     : "none";
+}
+
 double targetAudioTempo = 1.0;
 double currentAudioTempo = 1.0;
 
@@ -1117,14 +1136,18 @@ void decoderMainloop(bool calledByRaf) {
               // drawWebGpu()は少なくとも1フレーム遅れるので打ち消す
               videoPtsAdjustment =
                   frameDuration * ((adjusted == 0 ? 5 : adjusted * 2) - 8) / 8;
-              drawWebGpu(currentFrame, adjusted != 1);
+              drawWebGpu(currentFrame, adjusted != 1,
+                         deinterlaceMode != DeinterlaceMode::NONE,
+                         deinterlaceMode == DeinterlaceMode::BWDIF);
             }
           }
         }
         if (!telecineFlag) {
           // drawWebGpu()は少なくとも1フレーム遅れるので打ち消す
           videoPtsAdjustment = -frameDuration;
-          drawWebGpu(currentFrame, true);
+          drawWebGpu(currentFrame, true,
+                     deinterlaceMode != DeinterlaceMode::NONE,
+                     deinterlaceMode == DeinterlaceMode::BWDIF);
         }
       }
 

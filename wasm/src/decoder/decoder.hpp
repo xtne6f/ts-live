@@ -12,4 +12,5 @@ void reset();
 void playFile(std::string url);
 void setDualMonoMode(int mode);
 void setDetelecineMode(int mode);
+std::string setDeinterlace(std::string filter);
 void setPlaybackRate(double rate);

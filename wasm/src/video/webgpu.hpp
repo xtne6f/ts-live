@@ -5,4 +5,5 @@ extern "C" {
 }
 
 void initWebGpu();
-void drawWebGpu(AVFrame *frame, bool renderFlag);
+void drawWebGpu(AVFrame *frame, bool renderFlag, bool deinterlaceFlag,
+                bool bwdifFlag);
