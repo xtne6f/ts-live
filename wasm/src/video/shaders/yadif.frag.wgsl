@@ -58,6 +58,37 @@ fn absd(a: f32, b: f32) -> f32 {
   return max(a, b) - min(a, b);
 }
 
+fn spatial_predictor(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32, g: f32,
+                     h: f32, i: f32, j: f32, k: f32, l: f32, m: f32, n: f32) -> f32 {
+
+  // FFmpeg/libavfilter/vf_yadif_cuda.cu を参考にした。
+
+  var spatial_pred = avg(d, k);
+  var spatial_score = absd(c, j) + absd(d, k) + absd(e, l);
+
+  var score = absd(b, k) + absd(c, l) + absd(d, m);
+  if (score < spatial_score) {
+    spatial_pred = avg(c, l);
+    spatial_score = score;
+    score = absd(a, l) + absd(b, m) + absd(c, n);
+    if (score < spatial_score) {
+      spatial_pred = avg(b, m);
+      spatial_score = score;
+    }
+  }
+  score = absd(d, i) + absd(e, j) + absd(f, k);
+  if (score < spatial_score) {
+    spatial_pred = avg(e, j);
+    spatial_score = score;
+    score = absd(e, h) + absd(f, i) + absd(g, j);
+    if (score < spatial_score) {
+      spatial_pred = avg(f, i);
+      spatial_score = score;
+    }
+  }
+  return spatial_pred;
+}
+
 fn max3(a: f32, b: f32, c: f32) -> f32 {
   return max(max(a, b), c);
 }
@@ -71,72 +102,37 @@ fn yadif(cur: texture_2d<f32>, prev: texture_2d<f32>, next: texture_2d<f32>, x: 
     return load(cur, x, y);
   } else {
     var c = load(cur, x, y - 1);
-    var d = avg(load(cur, x, y), load(next, x, y));
+    var d = avg(load(prev, x, y), load(cur, x, y));
     var e = load(cur, x, y + 1);
-    var tmp_diff0 = absd(load(cur, x, y), load(next, x, y)) / 2.0;
+    var tmp_diff0 = absd(load(prev, x, y), load(cur, x, y)) / 2.0;
     var tmp_diff1 = avg(absd(load(prev, x, y - 1), c), absd(load(prev, x, y + 1), e));
     var tmp_diff2 = avg(absd(load(next, x, y - 1), c), absd(load(next, x, y + 1), e));
     var diff = max3(tmp_diff0, tmp_diff1, tmp_diff2);
 
-    var b = avg(load(cur, x, y - 2), load(next, x, y - 2));
-    var f = avg(load(cur, x, y + 2), load(next, x, y + 2));
+    var b = avg(load(prev, x, y - 2), load(cur, x, y - 2));
+    var f = avg(load(prev, x, y + 2), load(cur, x, y + 2));
     var max_ = max3(d - e, d -c, min(b -c, f - e));
     var min_ = min3(d - e, d -c, max(b -c, f - e));
     diff = max3(diff, min_, -max_);
 
+    var spatial_pred = spatial_predictor(
+      load(cur, x - 3, y - 1),
+      load(cur, x - 2, y - 1),
+      load(cur, x - 1, y - 1),
+      c,
+      load(cur, x + 1, y - 1),
+      load(cur, x + 2, y - 1),
+      load(cur, x + 3, y - 1),
 
-    // var spatial_pred_0 = avg(c, e);
-    var score_0 =
-      absd(load(cur, x - 1, y - 1), load(cur, x - 1, y + 1))
-      + absd(c, e)
-      + absd(load(cur, x + 1, y - 1), load(cur, x + 1, y + 1))
-      - 1.0 / 255.0;
+      load(cur, x - 3, y + 1),
+      load(cur, x - 2, y + 1),
+      load(cur, x - 1, y + 1),
+      e,
+      load(cur, x + 1, y + 1),
+      load(cur, x + 2, y + 1),
+      load(cur, x + 3, y + 1));
 
-    var score_1 =
-        absd(load(cur, x - 2, y - 1), load(cur, x - 0, y + 1))
-      + absd(load(cur, x - 1, y - 1), load(cur, x + 1, y + 1))
-      + absd(load(cur, x - 0, y - 1), load(cur, x + 2, y + 1));
-    // var spatial_pred_1 = avg(load(cur, x - 1, y - 1), load(cur, x + 1, y + 1));
-
-    var score_2 =
-        absd(load(cur, x - 0, y - 1), load(cur, x - 2, y + 1))
-      + absd(load(cur, x + 1, y - 1), load(cur, x - 1, y + 1))
-      + absd(load(cur, x + 2, y - 1), load(cur, x - 0, y + 1));
-    // var spatial_pred_2 = avg(load(cur, x + 1, y - 1), load(cur, x - 1, y + 1));
-
-    if (score_1 < score_0 && score_1 < score_2) {
-      var score_11 = 
-        absd(load(cur, x - 3, y - 1), load(cur, x + 1, y + 1))
-      + absd(load(cur, x - 2, y - 1), load(cur, x + 2, y + 1))
-      + absd(load(cur, x - 1, y - 1), load(cur, x + 3, y + 1));
-      // var spatial_pred_11 = avg(load(cur, x - 2, y - 1), load(cur, x + 2, y + 1));
-      if (score_11 < score_1) {
-        // spatial_pred = spatial_pred_11;
-        return clamp(avg(load(cur, x - 2, y - 1), load(cur, x + 2, y + 1)), d - diff, d + diff);
-      } else {
-        // spatial_pred = spatial_pred_1;
-        return clamp(avg(load(cur, x - 1, y - 1), load(cur, x + 1, y + 1)), d - diff, d + diff);
-      }
-    } else {
-      if (score_2 < score_0 && score_2 < score_1) {
-        var score_21 = 
-          absd(load(cur, x + 1, y - 1), load(cur, x - 3, y + 1))
-        + absd(load(cur, x + 2, y - 1), load(cur, x - 2, y + 1))
-        + absd(load(cur, x + 3, y - 1), load(cur, x - 1, y + 1));
-        // var spatial_pred_21 = avg(load(cur, x + 2, y - 1), load(cur, x - 2, y + 1));
-
-        if (score_21 < score_2) {
-          // spatial_pred = spatial_pred_21;
-          return clamp(avg(load(cur, x + 2, y - 1), load(cur, x - 2, y + 1)), d - diff, d + diff);
-        } else {
-          // spatial_pred = spatial_pred_2;
-          return clamp(avg(load(cur, x + 1, y - 1), load(cur, x - 1, y + 1)), d - diff, d + diff);
-        }
-      } else {
-        return clamp(avg(c, e), d - diff, d + diff);
-      }
-    }
-    // return clamp(spatial_pred, d - diff, d + diff);
+    return clamp(spatial_pred, d - diff, d + diff);
   }
 }
 
